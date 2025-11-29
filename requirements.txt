@@ -1,5 +1,23 @@
+# Telegram
 telethon==1.36.0
+
+# Web API
 fastapi==0.115.5
 uvicorn==0.32.0
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+psycopg2-binary==2.9.10  # для alembic и синхронных операций
+
+# Migrations
+alembic==1.14.0
+
+# Utils
 python-dotenv==1.0.1
-qrcode
+qrcode==8.0
+pydantic==2.10.2
+
+# Optional: image hashing for deduplication
+# imagehash==4.3.1
+# Pillow==11.0.0
