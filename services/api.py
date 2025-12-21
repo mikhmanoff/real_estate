@@ -5,6 +5,8 @@ REST API для Telegram Mini App.
 from typing import Optional, List
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from pydantic import BaseModel
 from decimal import Decimal
 
@@ -13,6 +15,11 @@ from sqlalchemy import select, and_, or_, func
 from database.models import Post, Listing, Media, Channel, District, MetroStation
 
 app = FastAPI(title="Rent Finder API", version="1.0.0")
+
+# Монтируем папку с медиа
+DOWNLOAD_DIR = Path("/home/mikhmanoff/project/downloads")
+if DOWNLOAD_DIR.exists():
+    app.mount("/media", StaticFiles(directory=str(DOWNLOAD_DIR)), name="media")
 
 # CORS для Mini App
 app.add_middleware(
@@ -230,7 +237,8 @@ async def get_listings(
                 }
             if media and media.local_path:
                 # Convert local path to URL (настроить под свой CDN/static)
-                photo_url = f"/media/{media.local_path.split('/')[-1]}"
+                parts = media.local_path.split('/')
+                photo_url = f"/media/{parts[-2]}/{parts[-1]}"
                 if photo_url not in listings_map[listing.id]["photos"]:
                     listings_map[listing.id]["photos"].append(photo_url)
         

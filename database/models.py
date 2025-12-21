@@ -137,6 +137,7 @@ class Listing(Base):
     district_raw: Mapped[Optional[str]] = mapped_column(String(255))
     metro_raw: Mapped[Optional[str]] = mapped_column(String(255))
     address_raw: Mapped[Optional[str]] = mapped_column(Text)
+    landmark: Mapped[Optional[str]] = mapped_column(String(255))  # NEW: Ориентир
 
     # Normalized location
     district_id: Mapped[Optional[int]] = mapped_column(Integer)
@@ -144,18 +145,37 @@ class Listing(Base):
     latitude: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 7))
     longitude: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 7))
 
-    # Amenities
+    # Rental conditions (NEW)
+    min_period_months: Mapped[Optional[int]] = mapped_column(SmallInteger)  # Мин. срок аренды
+    utilities_included: Mapped[Optional[bool]] = mapped_column(Boolean)  # Коммуналка включена
+    no_deposit: Mapped[bool] = mapped_column(Boolean, default=False)  # Без депозита
+
+    # Property condition (NEW)
+    condition: Mapped[Optional[str]] = mapped_column(String(100))  # Состояние/ремонт
+    house_type: Mapped[Optional[str]] = mapped_column(String(100))  # Тип дома (вторичка, новостройка)
+
+    # Amenities (extended)
     has_furniture: Mapped[Optional[bool]] = mapped_column(Boolean)
     has_appliances: Mapped[Optional[bool]] = mapped_column(Boolean)
     has_internet: Mapped[Optional[bool]] = mapped_column(Boolean)
     has_parking: Mapped[Optional[bool]] = mapped_column(Boolean)
     has_conditioner: Mapped[Optional[bool]] = mapped_column(Boolean)
+    has_washing_machine: Mapped[Optional[bool]] = mapped_column(Boolean)  # NEW
+    has_refrigerator: Mapped[Optional[bool]] = mapped_column(Boolean)  # NEW
+    has_balcony: Mapped[Optional[bool]] = mapped_column(Boolean)  # NEW
+
+    # Rules (NEW)
+    pets_allowed: Mapped[Optional[bool]] = mapped_column(Boolean)
+    kids_allowed: Mapped[Optional[bool]] = mapped_column(Boolean)
 
     # Contact
     contact_phone: Mapped[Optional[str]] = mapped_column(String(50))
     contact_name: Mapped[Optional[str]] = mapped_column(String(255))
     contact_tg: Mapped[Optional[str]] = mapped_column(String(100))
     is_agent: Mapped[Optional[bool]] = mapped_column(Boolean)
+
+    # Description (NEW)
+    description_clean: Mapped[Optional[str]] = mapped_column(Text)  # Чистое описание без технических данных
 
     # Parse quality
     parse_score: Mapped[int] = mapped_column(SmallInteger, default=0)

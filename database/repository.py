@@ -232,98 +232,102 @@ class MediaRepo:
 
 
 class ListingRepo:
-    def __init__(self, session: AsyncSession):
+    def __init__(self, session):
         self.session = session
 
-    async def create(self, post_id: int, parsed: Dict[str, Any]) -> Listing:
-        """Создаёт listing из распарсенных данных."""
+    async def create(self, post_id: int, parsed: dict) -> Listing:
+        """
+        Создаёт Listing из распарсенных данных.
+        
+        Args:
+            post_id: ID поста в БД
+            parsed: Результат parse_real_estate() из parser.py
+        
+        Returns:
+            Созданный Listing
+        """
+        # Рассчитываем parse_score (качество парсинга)
+        parse_score = 0
+        if parsed.get("rooms"): parse_score += 1
+        if parsed.get("floor"): parse_score += 1
+        if parsed.get("area_m2"): parse_score += 1
+        if parsed.get("price"): parse_score += 2
+        if parsed.get("district_raw"): parse_score += 1
+        if parsed.get("metro_raw"): parse_score += 1
+        if parsed.get("description_clean"): parse_score += 1
+        if parsed.get("phones"): parse_score += 1
+        
+        # Определяем, нужна ли ручная проверка
+        needs_review = parse_score < 4 or parsed.get("deal_type") == "unknown"
+        
+        # Берём первый телефон как контакт
+        phones = parsed.get("phones", [])
+        contact_phone = phones[0] if phones else None
+
         listing = Listing(
             post_id=post_id,
-            is_real_estate=parsed.get("is_real_estate", True),
+            
+            # Classification
+            is_real_estate=True,
             deal_type=parsed.get("deal_type"),
             object_type=parsed.get("object_type"),
+            
+            # Object parameters
             rooms=parsed.get("rooms"),
             rooms_options=parsed.get("rooms_options"),
             floor=parsed.get("floor"),
             total_floors=parsed.get("total_floors"),
             area_m2=parsed.get("area_m2"),
+            
+            # Price
             price=parsed.get("price"),
             currency=parsed.get("currency"),
             price_period=parsed.get("price_period"),
             deposit=parsed.get("deposit"),
             has_commission=parsed.get("has_commission", False),
+            
+            # Location
             district_raw=parsed.get("district_raw"),
             metro_raw=parsed.get("metro_raw"),
-            parse_score=self._compute_parse_score(parsed),
+            landmark=parsed.get("landmark"),
+            
+            # Rental conditions (NEW)
+            min_period_months=parsed.get("min_period_months"),
+            utilities_included=parsed.get("utilities_included"),
+            no_deposit=parsed.get("no_deposit", False),
+            
+            # Property condition (NEW)
+            condition=parsed.get("condition"),
+            house_type=parsed.get("house_type"),
+            
+            # Amenities
+            has_furniture=parsed.get("has_furniture"),
+            has_conditioner=parsed.get("has_conditioner"),
+            has_washing_machine=parsed.get("has_washing_machine"),
+            has_refrigerator=parsed.get("has_refrigerator"),
+            has_internet=parsed.get("has_internet"),
+            has_parking=parsed.get("has_parking"),
+            has_balcony=parsed.get("has_balcony"),
+            has_appliances=parsed.get("has_washing_machine") or parsed.get("has_refrigerator"),
+            
+            # Rules (NEW)
+            pets_allowed=parsed.get("pets_allowed"),
+            kids_allowed=parsed.get("kids_allowed"),
+            
+            # Contact
+            contact_phone=contact_phone,
+            
+            # Description (NEW)
+            description_clean=parsed.get("description_clean"),
+            
+            # Quality
+            parse_score=parse_score,
+            needs_review=needs_review,
         )
+        
         self.session.add(listing)
         await self.session.flush()
         return listing
-
-    @staticmethod
-    def _compute_parse_score(parsed: Dict[str, Any]) -> int:
-        """Оценка полноты парсинга 0-100."""
-        score = 0
-        if parsed.get("deal_type") and parsed["deal_type"] != "unknown":
-            score += 15
-        if parsed.get("object_type"):
-            score += 10
-        if parsed.get("rooms"):
-            score += 15
-        if parsed.get("floor"):
-            score += 10
-        if parsed.get("price"):
-            score += 20
-        if parsed.get("district_raw") or parsed.get("metro_raw"):
-            score += 15
-        if parsed.get("area_m2"):
-            score += 15
-        return min(score, 100)
-
-    async def get_by_post(self, post_id: int) -> Optional[Listing]:
-        stmt = select(Listing).where(Listing.post_id == post_id)
-        result = await self.session.execute(stmt)
-        return result.scalar_one_or_none()
-
-    async def search(
-        self,
-        deal_type: Optional[str] = None,
-        object_type: Optional[str] = None,
-        rooms: Optional[int] = None,
-        min_price: Optional[float] = None,
-        max_price: Optional[float] = None,
-        currency: str = "usd",
-        district_id: Optional[int] = None,
-        limit: int = 50,
-        offset: int = 0,
-    ) -> List[Listing]:
-        """Поиск объявлений с фильтрами."""
-        conditions = [Listing.is_real_estate == True]
-
-        if deal_type:
-            conditions.append(Listing.deal_type == deal_type)
-        if object_type:
-            conditions.append(Listing.object_type == object_type)
-        if rooms:
-            conditions.append(Listing.rooms == rooms)
-        if min_price:
-            conditions.append(Listing.price >= min_price)
-        if max_price:
-            conditions.append(Listing.price <= max_price)
-        if currency:
-            conditions.append(Listing.currency == currency)
-        if district_id:
-            conditions.append(Listing.district_id == district_id)
-
-        stmt = (
-            select(Listing)
-            .where(and_(*conditions))
-            .order_by(Listing.created_at.desc())
-            .offset(offset)
-            .limit(limit)
-        )
-        result = await self.session.execute(stmt)
-        return list(result.scalars().all())
 
 
 class DuplicateRepo:

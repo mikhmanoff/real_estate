@@ -21,6 +21,9 @@ from telethon.tl.types import (
 from core.registry import ChannelRegistry
 from core.utils import env, ensure_dirs
 from database import post_service, init_db, close_db
+from services.parser import parse_real_estate, extract_phones
+
+
 
 # ============================================
 # REGEX PATTERNS
@@ -250,10 +253,10 @@ def detect_location(text_norm: str):
     return district, metro
 
 
-def extract_phones(text: str):
-    if not text:
-        return []
-    return list({re.sub(r"\s+", " ", m.strip()) for m in PHONE_RE.findall(text)})
+# def extract_phones(text: str):
+#     if not text:
+#         return []
+#     return list({re.sub(r"\s+", " ", m.strip()) for m in PHONE_RE.findall(text)})
 
 
 def media_type_of(msg):
@@ -338,54 +341,54 @@ def guess_filename(msg, chat_id: int) -> str:
     return f"{chat_id}_{msg.id}.bin"
 
 
-def parse_real_estate(text: str, hashtags: list[str]) -> dict:
-    text = text or ""
-    text_norm = normalize_text(text)
-    hashtags = hashtags or []
+# def parse_real_estate(text: str, hashtags: list[str]) -> dict:
+#     text = text or ""
+#     text_norm = normalize_text(text)
+#     hashtags = hashtags or []
 
-    if not text_norm:
-        return {"is_real_estate": False}
+#     if not text_norm:
+#         return {"is_real_estate": False}
 
-    if not detect_is_real_estate(text_norm, hashtags):
-        return {"is_real_estate": False}
+#     if not detect_is_real_estate(text_norm, hashtags):
+#         return {"is_real_estate": False}
 
-    deal_type = detect_deal_type(text_norm, hashtags)
-    obj_type = detect_object_type(text_norm, hashtags)
+#     deal_type = detect_deal_type(text_norm, hashtags)
+#     obj_type = detect_object_type(text_norm, hashtags)
 
-    rooms, floor, total_floors = detect_rooms_floors_triple(text_norm)
-    rooms_options = None
+#     rooms, floor, total_floors = detect_rooms_floors_triple(text_norm)
+#     rooms_options = None
 
-    if rooms is None and floor is None and total_floors is None:
-        rooms, rooms_options = detect_rooms(text_norm)
-        f, tf = detect_floor(text_norm)
-        if floor is None:
-            floor = f
-        if total_floors is None:
-            total_floors = tf
+#     if rooms is None and floor is None and total_floors is None:
+#         rooms, rooms_options = detect_rooms(text_norm)
+#         f, tf = detect_floor(text_norm)
+#         if floor is None:
+#             floor = f
+#         if total_floors is None:
+#             total_floors = tf
 
-    area = detect_area(text_norm)
-    price, cur, period = detect_price_and_period(text_norm, deal_type)
-    deposit = detect_deposit(text_norm)
-    district, metro = detect_location(text_norm)
+#     area = detect_area(text_norm)
+#     price, cur, period = detect_price_and_period(text_norm, deal_type)
+#     deposit = detect_deposit(text_norm)
+#     district, metro = detect_location(text_norm)
 
-    return {
-        "is_real_estate": True,
-        "deal_type": deal_type,
-        "object_type": obj_type,
-        "rooms": rooms,
-        "rooms_options": rooms_options,
-        "floor": floor,
-        "total_floors": total_floors,
-        "area_m2": area,
-        "price": price,
-        "currency": cur,
-        "price_period": period,
-        "deposit": deposit,
-        "district_raw": district,
-        "metro_raw": metro,
-        "has_commission": any(x in text_norm.lower()
-                              for x in ["комиссионные", "maklerskiy", "риелтор"]),
-    }
+#     return {
+#         "is_real_estate": True,
+#         "deal_type": deal_type,
+#         "object_type": obj_type,
+#         "rooms": rooms,
+#         "rooms_options": rooms_options,
+#         "floor": floor,
+#         "total_floors": total_floors,
+#         "area_m2": area,
+#         "price": price,
+#         "currency": cur,
+#         "price_period": period,
+#         "deposit": deposit,
+#         "district_raw": district,
+#         "metro_raw": metro,
+#         "has_commission": any(x in text_norm.lower()
+#                               for x in ["комиссионные", "maklerskiy", "риелтор"]),
+#     }
 
 
 def get_chat_type(chat) -> str:
