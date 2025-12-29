@@ -1,170 +1,274 @@
-# services/parser.py
+# parser_v2.py
 """
-Улучшенный парсер объявлений недвижимости из Telegram.
-Извлекает структурированные данные и чистое описание.
+Парсер объявлений недвижимости из Telegram каналов Ташкента.
+Поддерживает русский и узбекский языки, множество форматов.
 """
 import re
 from typing import Optional, List, Dict, Any, Tuple
+from dataclasses import dataclass, field, asdict
+
+
+# ============================================
+# DISTRICTS & METRO DATA
+# ============================================
+
+DISTRICTS = {
+    # Название в нижнем регистре -> нормализованное название
+    "мирзо улугбек": "Мирзо-Улугбекский",
+    "мирзо-улугбек": "Мирзо-Улугбекский",
+    "мирзо_улугбек": "Мирзо-Улугбекский",
+    "мирзоулугбек": "Мирзо-Улугбекский",
+    "мирзо улугбекский": "Мирзо-Улугбекский",
+    "mirzo ulug'bek": "Мирзо-Улугбекский",
+    
+    "юнусабад": "Юнусабадский",
+    "юнус абад": "Юнусабадский",
+    "юнусабадский": "Юнусабадский",
+    "yunusabad": "Юнусабадский",
+    
+    "чиланзар": "Чиланзарский",
+    "чиланзарский": "Чиланзарский",
+    "chilanzar": "Чиланзарский",
+    
+    "мирабад": "Мирабадский",
+    "мирабадский": "Мирабадский",
+    "mirabad": "Мирабадский",
+    
+    "яккасарай": "Яккасарайский",
+    "яккасарайский": "Яккасарайский",
+    "yakkasaroy": "Яккасарайский",
+    
+    "сергели": "Сергелийский",
+    "сергелийский": "Сергелийский",
+    "sergeli": "Сергелийский",
+    
+    "шайхантахур": "Шайхантахурский",
+    "шайхонтогур": "Шайхантахурский",
+    "шайхантахурский": "Шайхантахурский",
+    "shayxontohur": "Шайхантахурский",
+    
+    "алмазар": "Алмазарский",
+    "алмазарский": "Алмазарский",
+    "olmazar": "Алмазарский",
+    
+    "бектемир": "Бектемирский",
+    "бектемирский": "Бектемирский",
+    "bektemir": "Бектемирский",
+    
+    "яшнабад": "Яшнабадский",
+    "яшнобад": "Яшнабадский",
+    "яшнабадский": "Яшнабадский",
+    "yashnabad": "Яшнабадский",
+    
+    "учтепа": "Учтепинский",
+    "учтепинский": "Учтепинский",
+    "uchtepa": "Учтепинский",
+    
+    "ц-1": "Мирзо-Улугбекский",  # Ц-1 это район в Мирзо-Улугбеке
+}
+
+METRO_STATIONS = {
+    "минор": "Минор",
+    "minor": "Минор",
+    "ойбек": "Ойбек",
+    "oybek": "Ойбек",
+    "пушкин": "Пушкинская",
+    "космонавтов": "Космонавтлар",
+    "хамид олимжон": "Хамида Олимжона",
+    "буюк ипак йули": "Буюк Ипак Йўли",
+    "buyuk ipak yo'li": "Буюк Ипак Йўли",
+    "милий бог": "Миллий Боғ",
+    "milliy bog": "Миллий Боғ",
+    "тузель": "Тузел",
+    "tuzel": "Тузел",
+    "сергели": "Сергели",
+    "sergeli": "Сергели",
+    "чкалов": "Чкалов",
+}
+
+LANDMARKS = [
+    "it park", "ит парк",
+    "tata", "тата",
+    "мегапланет", "megaplanet",
+    "hi-tech", "хай-тек",
+    "паркентский", "parkent",
+    "ассалом сохил", "assalom sohil",
+    "akay city", "акай сити",
+    "imperial club", "империал клуб",
+    "mirabad avenue",
+    "prestige gardens",
+    "solaris", "солярис",
+]
 
 
 # ============================================
 # REGEX PATTERNS
 # ============================================
 
-PHONE_RE = re.compile(r"(?:\+?\d[\s\-\(\)]*){7,15}")
+# Телефоны - улучшенный паттерн
+PHONE_PATTERNS = [
+    re.compile(r'\+998[\s\-]?\d{2}[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}'),
+    re.compile(r'\+998\d{9}'),
+    re.compile(r'998\d{9}'),
+    re.compile(r'\d{2}[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}'),  # 90 123 45 67
+]
 
-# Формат: комнаты/этаж/этажность (например: 2/5/9)
-TRIPLE_ROOMS_FLOORS = re.compile(r"\b(\d+)\s*/\s*(\d+)\s*/\s*(\d+)\b")
+# Формат комнаты/этаж/этажность: 1/4/4, 2/3/9
+TRIPLE_FORMAT = re.compile(r'[⚫🟠🔴\s]*(\d+)\s*/\s*(\d+)\s*/\s*(\d+)[⚫🟠🔴\s]*')
 
-# Комнаты
+# Комнаты - разные форматы
 ROOMS_PATTERNS = [
-    re.compile(r"кол[–\-]?во\s+комнат\s*[:\-–]?\s*(\d+)", re.I),
-    re.compile(r"комнат\s*[:\-–]?\s*(\d+)", re.I),
-    re.compile(r"(\d+)\s*[–\-]?\s*комн", re.I),
-    re.compile(r"(\d+)\s*хонали", re.I),  # узбекский
-    re.compile(r"(\d+)\s*xonali", re.I),
+    # "Комнат: 2", "Комнат-2", "🏡 Комнат: 1"
+    re.compile(r'(?:🏡\s*)?комнат[аы]?\s*[:\-–]\s*(\d+)', re.I),
+    # "Кол.Комнат:2", "Кол-во комнат: 1"
+    re.compile(r'кол[\.\-]?\s*(?:во\s+)?комнат\s*[:\-–]\s*(\d+)', re.I),
+    # "2 комнатная", "1-комнатная"
+    re.compile(r'(\d+)\s*[–\-]?\s*комнат(?:ная|ка)', re.I),
+    # Узбекский: "Xonalar soni: 2", "2 XONA"
+    re.compile(r'xonalar?\s*(?:soni)?\s*[:\-–]?\s*(\d+)', re.I),
+    re.compile(r'(\d+)\s*xona', re.I),
+    # "🔹Комнат: 2", "🔸Комнат: 2"
+    re.compile(r'[🔹🔸💮]\s*комнат[аы]?\s*[:\-–]?\s*(\d+)', re.I),
 ]
 
 # Этаж
 FLOOR_PATTERNS = [
-    re.compile(r"этаж\s*[:\-–]?\s*(\d+)", re.I),
-    re.compile(r"(\d+)\s*[–\-]?\s*этаж(?!н)", re.I),
-    re.compile(r"qavat\s*[:\-–]?\s*(\d+)", re.I),
+    re.compile(r'(?:🔼|♦️|🔸|🔹|💮)?\s*этаж\s*[:\-–]?\s*(\d+)', re.I),
+    re.compile(r'(\d+)\s*этаж(?!н)', re.I),
+    re.compile(r'qavat\s*[:\-–]?\s*(\d+)', re.I),
 ]
 
 # Этажность
 TOTAL_FLOORS_PATTERNS = [
-    re.compile(r"этажность\s*[:\-–]?\s*(\d+)", re.I),
-    re.compile(r"этажей\s+в\s+доме\s*[:\-–]?\s*(\d+)", re.I),
-    re.compile(r"(\d+)\s*[–\-]?\s*этажн", re.I),
+    re.compile(r'(?:⏫|🔸|🔹|💮)?\s*этажност[ьи]\s*[:\-–]?\s*(\d+)', re.I),
+    re.compile(r'этажей\s*(?:в\s*доме)?\s*[:\-–]?\s*(\d+)', re.I),
+    re.compile(r'(\d+)\s*[–\-]?\s*этажн(?:ый|ая|ое|ость)', re.I),
 ]
 
 # Площадь
 AREA_PATTERNS = [
-    re.compile(r"площад[ьия]\s*[:\-–]?\s*(\d+(?:[.,]\d+)?)\s*(?:кв\.?\s*м|м[²2]?)", re.I),
-    re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:кв\.?\s*м|м[²2])", re.I),
-    re.compile(r"площад[ьия][–\-]?\s*(\d+)", re.I),
+    re.compile(r'(?:📐|🔎)?\s*(?:общая\s+)?площад[ьия]\s*[:\-–]?\s*(\d+(?:[.,]\d+)?)\s*(?:кв\.?\s*м(?:етр)?|м[²2]?)?', re.I),
+    re.compile(r'(\d+(?:[.,]\d+)?)\s*(?:кв\.?\s*м|м[²2])', re.I),
+    re.compile(r'площад[ьия]\s*(\d+)\s*кв', re.I),
 ]
 
-# Цена
+# Цена - много форматов
 PRICE_PATTERNS = [
-    re.compile(r"цена\s*[:\-–]?\s*(\d[\d\s]*\d|\d)\s*(\$|уе|у\.е|y\.e|долл|сум|sum|so'm|сўм)?", re.I),
-    re.compile(r"narx\s*[:\-–]?\s*(\d[\d\s]*\d|\d)\s*(\$|уе|у\.е|y\.e|долл|сум|sum|so'm|сўм)?", re.I),
-    re.compile(r"(\d[\d\s]*\d|\d)\s*\$\s*(?:/\s*мес|в\s*мес)?", re.I),
-    re.compile(r"(\d[\d\s]*\d)\s*(сум|sum|so'm|сўм)", re.I),
+    # "Цена: 700", "💸 Цена: 600", "Цена -700"
+    re.compile(r'(?:💸|💰)?\s*(?:цена|narx)\s*[:\-–]?\s*(\d[\d\s]*)\s*(\$|y\.?e\.?|уе|долл|сум)?', re.I),
+    # "700$", "600 $", "500y.e"
+    re.compile(r'(\d{3,})\s*(\$|y\.?e\.?|уе|долл)', re.I),
+    # "350$+300$ Депозит" - берём первую цену
+    re.compile(r'(\d{3,})\s*\$\s*\+', re.I),
+    # Узбекский "Narx: 350 $"
+    re.compile(r'narx\s*[:\-–]?\s*(\d+)\s*(\$|so\'?m|сум)?', re.I),
 ]
 
 # Депозит
 DEPOSIT_PATTERNS = [
-    re.compile(r"(?:без\s+)?депозит[аы]?\s*[:\-–]?\s*(\d[\d\s]*)?", re.I),
-    re.compile(r"залог\s*[:\-–]?\s*(\d[\d\s]*)?", re.I),
-    re.compile(r"предоплат[аы]?\s*[:\-–]?\s*(\d[\d\s]*)?", re.I),
+    # "+300$ Депозит", "Депозит 300$"
+    re.compile(r'\+\s*(\d+)\s*\$?\s*депозит', re.I),
+    re.compile(r'депозит\s*[:\-–]?\s*(\d+)\s*\$?', re.I),
+    # "Депозит 50$", "Депозит: 250$"
+    re.compile(r'депозит\s+(\d+)', re.I),
+    # "|Депозит 250$|"
+    re.compile(r'\|депозит\s*(\d+)', re.I),
 ]
 
-# Район
+# Проверка "без депозита"
+NO_DEPOSIT_PATTERN = re.compile(r'без\s+депозит', re.I)
+
+# Район - в хештегах и тексте
 DISTRICT_PATTERNS = [
-    re.compile(r"#?([А-ЯЁA-Z][а-яёa-z]+(?:ский|ий)?)\s*(?:район|р-н)", re.I),
-    re.compile(r"район\s*[:\-–]?\s*([А-ЯЁа-яё\s]+?)(?:\s*[,\n◆]|$)", re.I),
-    re.compile(r"#(Юнусабад|Чиланзар|Мирабад|Яккасарай|Мирзо.?Улугбек|Сергели|Шайхантахур|Алмазар|Бектемир|Яшнабад|Учтепа)", re.I),
+    # Хештеги: #Мирзо_Улугбек, #Чиланзарский
+    re.compile(r'#([А-ЯЁа-яё_\-]+(?:ский|ий)?)\s*(?:район)?', re.I),
+    # "📍 Район: Мирзо Улугбекский"
+    re.compile(r'(?:📍)?\s*район\s*[:\-–]?\s*([А-ЯЁа-яё\s\-]+?)(?:\s*[,\n📍🎯]|$)', re.I),
+    # "Мирзо-Улугбекский район"
+    re.compile(r'([А-ЯЁа-яё\-]+(?:ский|ий))\s+район', re.I),
+    # Узбекский: "MIRZO ULUG'BEK TUMANI"
+    re.compile(r"([A-Za-z'\s]+)\s+tumani", re.I),
+]
+
+# Адрес/Ориентир
+ADDRESS_PATTERNS = [
+    # "🎯 Адрес: ЖК Узмахал"
+    re.compile(r'(?:🎯|⛳️)?\s*(?:адрес|manzil)\s*[:\-–]?\s*(.+?)(?:\n|$)', re.I),
+    # "Ор-р Точка вкуса", "Ориентир: Метро минор"
+    re.compile(r'(?:ор[–\-]р|ориентир|mo\'ljal)\s*[:\-–]?\s*(.+?)(?:\n|$)', re.I),
 ]
 
 # Метро
 METRO_PATTERNS = [
-    re.compile(r"(?:м\.|метро|metro)\s*[:\-–]?\s*([А-ЯЁа-яёA-Za-z\s]+?)(?:\s*[,\n◆]|$)", re.I),
-    re.compile(r"#?метро[_\s]?([А-ЯЁа-яё]+)", re.I),
+    re.compile(r'метро\s+([А-ЯЁа-яёA-Za-z\s\']+?)(?:\s*[,\n🚊📍]|$)', re.I),
+    re.compile(r'metro\s+([A-Za-z\s\']+?)(?:\s*[,\n🚊]|$)', re.I),
 ]
 
-# Ориентир / адрес
-LANDMARK_PATTERNS = [
-    re.compile(r"(?:ор[–\-]р|ориентир)\s*[:\-–]?\s*(.+?)(?:\s*[◆\n]|$)", re.I),
-    re.compile(r"(?:рядом\s+с|возле|около|близко\s+к)\s+(.+?)(?:\s*[,\n◆]|$)", re.I),
+# ЖК (жилой комплекс)
+JK_PATTERN = re.compile(r'(?:жк|jk)\s*["\']?([А-ЯЁа-яёA-Za-z\s\-\']+)["\']?', re.I)
+
+# Комиссия
+COMMISSION_PATTERNS = [
+    re.compile(r'комисс?ионн?ы?е?\s*(\d+)?\s*%?', re.I),
+    re.compile(r'maklerskiy\s*(\d+)?\s*%?', re.I),
+    re.compile(r'риелтор\s*услуги?\s*(\d+)?\s*%?', re.I),
+    re.compile(r'\((\d+)\s*%\s*\)', re.I),  # (50%)
 ]
 
-# Мин. срок аренды
-MIN_PERIOD_PATTERNS = [
-    re.compile(r"(?:мин\.?\s*)?срок\s*[:\-–]?\s*(?:от\s+)?(\d+)\s*мес", re.I),
-    re.compile(r"от\s+(\d+)\s*мес", re.I),
-    re.compile(r"(\d+)\s*мес(?:яц)?\s*(?:минимум|мин)", re.I),
-]
-
-# Коммуналка
-UTILITIES_PATTERNS = [
-    re.compile(r"коммунал(?:ка|ьные)?\s*[:\-–]?\s*(включен|отдельно|входит|не\s*входит)", re.I),
-    re.compile(r"комм?\.?\s*услуги\s*[:\-–]?\s*(включен|отдельно)", re.I),
+# Без комиссии/маклера
+NO_COMMISSION_PATTERNS = [
+    re.compile(r'без\s+(?:маклер|комисс|посредник)', re.I),
+    re.compile(r'bezmakler', re.I),
+    re.compile(r'не\s+для\s+риелтор', re.I),
 ]
 
 # Состояние/ремонт
 CONDITION_PATTERNS = [
-    re.compile(r"состояние\s*[:\-–]?\s*([А-Яа-яЁё\s]+?)(?:\s*[◆\n,]|$)", re.I),
-    re.compile(r"ремонт\s*[:\-–]?\s*([А-Яа-яЁё\s]+?)(?:\s*[◆\n,]|$)", re.I),
-    re.compile(r"(евро\s*ремонт|новый\s*ремонт|косметический|без\s*ремонта)", re.I),
+    re.compile(r'(?:🏷|🔷)?\s*состояние\s*[:\-–]?\s*([А-ЯЁа-яё\s]+?)(?:\s*[,\n🔹💮ID]|$)', re.I),
+    re.compile(r'(евро\s*ремонт|новый\s*ремонт|хороший\s*ремонт|классический\s*ремонт)', re.I),
+    re.compile(r'evro\s*ta\'?mir', re.I),
 ]
 
 # Тип дома
 HOUSE_TYPE_PATTERNS = [
-    re.compile(r"тип\s*дома\s*[:\-–]?\s*([А-Яа-яЁё\s]+?)(?:\s*[◆\n,]|$)", re.I),
-    re.compile(r"(вторичн|новостройка|панельн|кирпичн|монолит)", re.I),
+    re.compile(r'тип\s*дома\s*[:\-–]?\s*([А-ЯЁа-яё\s]+?)(?:\s*[,\n🔹]|$)', re.I),
+    re.compile(r'(новостройка|вторичн\w*(?:\s*фонд)?)', re.I),
+    re.compile(r'(?:☑️)?\s*(новостройка|вторичн\w*)', re.I),
 ]
 
-# Удобства
-AMENITIES_KEYWORDS = {
-    'furniture': [
-        r'мебел[ьия]', r'меблирован', r'с\s+мебелью', r'мебель\s+есть',
-        r'mebel', r'furnished'
+# Удобства - ключевые слова
+AMENITIES = {
+    'has_furniture': [
+        r'мебел[ьия]', r'меблирован', r'с\s+мебелью',
+        r'mebel', r'диван', r'кровать', r'divan'
     ],
-    'conditioner': [
-        r'кондиц', r'сплит', r'konditsioner', r'air\s*condition'
+    'has_conditioner': [
+        r'кондиц', r'сплит', r'konditsioner', r'konditsoner'
     ],
-    'washing_machine': [
-        r'стирал', r'стир\.?\s*маш', r'washing'
+    'has_washing_machine': [
+        r'стирал', r'стир\.?\s*маш', r'кирмошина', r'kirmoshina'
     ],
-    'refrigerator': [
-        r'холодильник', r'хол-к', r'fridge', r'refrigerator'
+    'has_refrigerator': [
+        r'холодильник', r'muzlatgich'
     ],
-    'internet': [
-        r'интернет', r'wi-?fi', r'wifi', r'internet'
+    'has_internet': [
+        r'интернет', r'wi-?fi', r'wifi'
     ],
-    'parking': [
-        r'парковка', r'паркинг', r'машиноместо', r'parking', r'гараж'
+    'has_tv': [
+        r'телевизор', r'televizor', r'тв'
     ],
-    'balcony': [
+    'has_balcony': [
         r'балкон', r'лоджия', r'balkon'
-    ],
-    'pets_allowed': [
-        r'можно\s+с\s+животн', r'животные\s+разрешен', r'pets\s+allowed',
-        r'с\s+питомц'
-    ],
-    'kids_allowed': [
-        r'можно\s+с\s+детьми', r'дети\s+разрешен', r'семь[ея]\s+с\s+детьми'
     ],
 }
 
-# Технические строки для удаления из описания
-TECHNICAL_PATTERNS = [
-    r'#\S+',  # хештеги
-    r'◆\s*',  # маркеры
-    r'[◇◈●•]\s*',
-    r'тип\s*дома\s*[:\-–]?\s*[^\n◆]+',
-    r'кол[–\-]?во\s+комнат\s*[:\-–]?\s*\d+',
-    r'этаж\s*[:\-–]?\s*\d+',
-    r'этажность\s*[:\-–]?\s*\d+',
-    r'площад[ьия]\s*[:\-–]?\s*[\d.,]+\s*(?:кв\.?\s*м|м[²2]?)?',
-    r'площад[ьия][\-–]?\s*\d+',
-    r'цена\s*[:\-–]?\s*[^\n◆]+',
-    r'narx\s*[:\-–]?\s*[^\n◆]+',
-    r'депозит\s*[:\-–]?\s*[^\n◆]*',
-    r'предоплат[аы]?\s*[:\-–]?\s*[^\n◆]*',
-    r'залог\s*[:\-–]?\s*[^\n◆]*',
-    r'состояние\s*[:\-–]?\s*[^\n◆]+',
-    r'комиссионные\s*[^\n◆]*',
-    r'комиссия\s*[^\n◆]*',
-    r'maklerskiy\s*[^\n◆]*',
-    r'ID\s*[:\-–]?\s*\d+',
-    r'\d+\s*/\s*\d+\s*/\s*\d+',  # формат комнаты/этаж/этажность
-    r'(\+?\d[\s\-\(\)]*){7,15}',  # телефоны
-    r't\.me/\S+',  # telegram ссылки
-    r'@\S+',  # telegram юзернеймы
-]
+# Кому сдаётся
+TENANT_PATTERNS = {
+    'family': [r'семь[яе]', r'oila', r'загс'],
+    'girls': [r'девушк', r'qizlar'],
+    'guys': [r'парн', r'болларга', r'bollar'],
+    'single': [r'одиноч', r'один\s+парень', r'один\s+человек'],
+}
 
 
 # ============================================
@@ -172,11 +276,12 @@ TECHNICAL_PATTERNS = [
 # ============================================
 
 def normalize_text(text: str) -> str:
-    """Нормализует текст: убирает лишние пробелы, заменяет спецсимволы."""
+    """Нормализует текст для парсинга."""
     if not text:
         return ""
-    t = text.replace("\u00a0", " ")  # non-breaking space
-    t = t.replace("–", "-").replace("—", "-")
+    # Заменяем разные виды тире и пробелов
+    t = text.replace('\u00a0', ' ')  # non-breaking space
+    t = t.replace('–', '-').replace('—', '-')
     t = re.sub(r'\s+', ' ', t)
     return t.strip()
 
@@ -185,7 +290,9 @@ def extract_number(text: str) -> Optional[int]:
     """Извлекает число из строки."""
     if not text:
         return None
-    digits = re.sub(r'\D', '', text)
+    # Убираем пробелы внутри числа
+    digits = re.sub(r'[\s\-]', '', text)
+    digits = re.sub(r'\D', '', digits)
     if digits:
         try:
             return int(digits)
@@ -195,10 +302,9 @@ def extract_number(text: str) -> Optional[int]:
 
 
 def extract_float(text: str) -> Optional[float]:
-    """Извлекает дробное число из строки."""
+    """Извлекает дробное число."""
     if not text:
         return None
-    # Заменяем запятую на точку
     text = text.replace(',', '.')
     match = re.search(r'(\d+(?:\.\d+)?)', text)
     if match:
@@ -218,8 +324,8 @@ def match_first(patterns: List[re.Pattern], text: str) -> Optional[re.Match]:
     return None
 
 
-def check_keywords(text: str, keywords: List[str]) -> bool:
-    """Проверяет наличие ключевых слов в тексте."""
+def check_any_keyword(text: str, keywords: List[str]) -> bool:
+    """Проверяет наличие любого ключевого слова."""
     text_lower = text.lower()
     for kw in keywords:
         if re.search(kw, text_lower, re.I):
@@ -227,109 +333,81 @@ def check_keywords(text: str, keywords: List[str]) -> bool:
     return False
 
 
+def normalize_district(raw: str) -> Optional[str]:
+    """Нормализует название района."""
+    if not raw:
+        return None
+    # Убираем лишние символы
+    clean = re.sub(r'[#_\-]', ' ', raw.lower()).strip()
+    clean = re.sub(r'\s+', ' ', clean)
+    
+    # Ищем в словаре
+    for key, value in DISTRICTS.items():
+        if key in clean or clean in key:
+            return value
+    
+    # Возвращаем очищенное если не нашли
+    if len(clean) > 3:
+        return clean.title()
+    return None
+
+
+def normalize_metro(raw: str) -> Optional[str]:
+    """Нормализует название станции метро."""
+    if not raw:
+        return None
+    clean = raw.lower().strip()
+    
+    for key, value in METRO_STATIONS.items():
+        if key in clean:
+            return value
+    
+    if len(clean) > 2:
+        return clean.title()
+    return None
+
+
 # ============================================
-# PARSING FUNCTIONS
+# MAIN PARSING FUNCTIONS  
 # ============================================
 
-def detect_is_real_estate(text: str, hashtags: List[str]) -> bool:
-    """Определяет, является ли пост объявлением о недвижимости."""
-    t = text.lower()
-    tags = " ".join(h.lower() for h in (hashtags or []))
+def extract_phones(text: str) -> List[str]:
+    """Извлекает телефонные номера."""
+    if not text:
+        return []
     
-    keywords = [
-        "квартира", "квартиру", "кв ", "комнат", "участок", "недвижим",
-        "аренда", "сдается", "сдаётся", "сдам", "сниму", "снять",
-        "посуточно", "риелтор", "риэлтор", "депозит", "комиссионные",
-        "maklerskiy", "narx", "ijara", "xona", "kvartira"
-    ]
+    phones = set()
     
-    if any(k in t for k in keywords):
-        return True
+    # Ищем полные номера +998XXXXXXXXX
+    full_pattern = re.compile(r'\+?998\s*[\-\(\)]?\s*(\d{2})\s*[\-\(\)]?\s*(\d{3})\s*[\-\(\)]?\s*(\d{2})\s*[\-\(\)]?\s*(\d{2})')
+    for match in full_pattern.finditer(text):
+        phone = '+998' + ''.join(match.groups())
+        phones.add(phone)
     
-    tag_keywords = ["аренда", "квартира", "дом", "недвиж", "rent", "flat"]
-    if any(k in tags for k in tag_keywords):
-        return True
+    # Ищем короткие номера (9 цифр без кода страны)
+    if not phones:
+        short_pattern = re.compile(r'\b(\d{2})[\s\-]?(\d{3})[\s\-]?(\d{2})[\s\-]?(\d{2})\b')
+        for match in short_pattern.finditer(text):
+            digits = ''.join(match.groups())
+            # Проверяем что это похоже на узбекский номер
+            if digits[0] in '789':
+                phones.add('+998' + digits)
     
-    # Проверяем наличие цены в долларах
-    if re.search(r'\d+\s*\$', t):
-        return True
-    
-    return False
+    return list(phones)
 
 
-def detect_deal_type(text: str, hashtags: List[str]) -> str:
-    """Определяет тип сделки: аренда долгосрочная/посуточная, продажа, поиск."""
-    t = text.lower()
-    tags = " ".join(h.lower() for h in (hashtags or []))
-    
-    # Поиск (человек ищет квартиру)
-    if any(x in t for x in ["сниму", "ищу квартиру", "ищу дом", "ищу комнату", "нужна квартира"]):
-        return "wanted_rent"
-    if "куплю" in t:
-        return "wanted_buy"
-    
-    # Посуточная аренда
-    if any(x in t for x in ["посуточно", "сутки", "по суткам", "на сутки", "sutkalik"]):
-        return "rent_daily"
-    
-    # Продажа
-    if any(x in t for x in ["продам", "продаю", "продажа", "на продажу", "sotiladi"]) or "продажа" in tags:
-        return "sale"
-    
-    # Долгосрочная аренда (по умолчанию для объявлений о сдаче)
-    if any(x in t for x in ["аренда", "сдается", "сдаётся", "сдам", "в аренду", "ijara"]) or "аренда" in tags:
-        return "rent_long"
-    
-    # Если есть признаки аренды
-    if any(x in t for x in ["депозит", "комиссионные", "maklerskiy", "риелтор", "/мес", "в месяц"]):
-        return "rent_long"
-    
-    return "rent_long"  # по умолчанию
-
-
-def detect_object_type(text: str, hashtags: List[str]) -> str:
-    """Определяет тип объекта: квартира, комната, дом и т.д."""
-    t = text.lower()
-    tags = " ".join(h.lower() for h in (hashtags or []))
-    
-    # Студия - проверяем первой
-    if any(x in t for x in ["студия", "студию"]):
-        return "studio"
-    
-    # Комната
-    if any(x in t for x in ["комната", "комнату", "койко-место"]) and "комнат" not in t.replace("комнату", "").replace("комната", ""):
-        return "room"
-    
-    # Квартира - если есть слово "квартира" или признаки квартиры (комнаты, этаж)
-    if any(x in t for x in ["квартир", " кв ", "кв.", "kvartira"]) or "квартира" in tags:
-        return "flat"
-    
-    # Если есть этаж/этажность - скорее всего квартира
-    if re.search(r'этаж|qavat', t):
-        return "flat"
-    
-    # Дом
-    if any(x in t for x in ["частный дом", "дом ", "дом,", "дом.", "hovli", "коттедж"]) or "дом" in tags:
-        return "house"
-    
-    # Участок
-    if any(x in t for x in ["участок", "соток", "сотки", "земля", "yer"]):
-        return "land"
-    
-    # Коммерческая
-    if any(x in t for x in ["офис", "коммерческ", "торговая площадь", "помещение"]):
-        return "commercial"
-    
-    # Квартира по умолчанию
-    return "flat"
-
-
-def parse_rooms_floor_triple(text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
-    """Парсит формат комнаты/этаж/этажность."""
-    match = TRIPLE_ROOMS_FLOORS.search(text)
+def parse_triple_format(text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Парсит формат X/X/X (комнаты/этаж/этажность)."""
+    match = TRIPLE_FORMAT.search(text)
     if match:
         try:
-            return int(match.group(1)), int(match.group(2)), int(match.group(3))
+            rooms = int(match.group(1))
+            floor = int(match.group(2))
+            total_floors = int(match.group(3))
+            # Валидация
+            if 0 < rooms <= 10 and 0 < floor <= 50 and 0 < total_floors <= 50:
+                if floor <= total_floors:
+                    return rooms, floor, total_floors
         except (ValueError, IndexError):
             pass
     return None, None, None
@@ -339,7 +417,9 @@ def parse_rooms(text: str) -> Optional[int]:
     """Извлекает количество комнат."""
     match = match_first(ROOMS_PATTERNS, text)
     if match:
-        return extract_number(match.group(1))
+        rooms = extract_number(match.group(1))
+        if rooms and 0 < rooms <= 10:
+            return rooms
     return None
 
 
@@ -348,98 +428,117 @@ def parse_floor(text: str) -> Tuple[Optional[int], Optional[int]]:
     floor = None
     total_floors = None
     
-    floor_match = match_first(FLOOR_PATTERNS, text)
-    if floor_match:
-        floor = extract_number(floor_match.group(1))
+    # Ищем этаж
+    match = match_first(FLOOR_PATTERNS, text)
+    if match:
+        floor = extract_number(match.group(1))
+        if floor and floor > 50:
+            floor = None
     
-    total_match = match_first(TOTAL_FLOORS_PATTERNS, text)
-    if total_match:
-        total_floors = extract_number(total_match.group(1))
+    # Ищем этажность
+    match = match_first(TOTAL_FLOORS_PATTERNS, text)
+    if match:
+        total_floors = extract_number(match.group(1))
+        if total_floors and total_floors > 50:
+            total_floors = None
     
     return floor, total_floors
 
 
 def parse_area(text: str) -> Optional[float]:
-    """Извлекает площадь в м²."""
+    """Извлекает площадь."""
     match = match_first(AREA_PATTERNS, text)
     if match:
-        return extract_float(match.group(1))
+        area = extract_float(match.group(1))
+        if area and 5 < area < 1000:  # разумные пределы
+            return area
     return None
 
 
-def parse_price(text: str, deal_type: str) -> Tuple[Optional[int], Optional[str], Optional[str]]:
-    """Извлекает цену, валюту и период."""
-    price = None
-    currency = None
-    period = None
-    
+def parse_price(text: str) -> Tuple[Optional[int], Optional[str]]:
+    """Извлекает цену и валюту."""
     for pattern in PRICE_PATTERNS:
         match = pattern.search(text)
         if match:
             price = extract_number(match.group(1))
+            if not price:
+                continue
             
             # Определяем валюту
-            cur_match = match.group(2) if match.lastindex >= 2 else None
-            if cur_match:
-                cur_lower = cur_match.lower()
-                if any(x in cur_lower for x in ["сум", "sum", "so'm", "сўм"]):
+            currency = "usd"  # по умолчанию
+            if match.lastindex >= 2 and match.group(2):
+                cur_raw = match.group(2).lower()
+                if any(x in cur_raw for x in ['сум', 'sum', "so'm"]):
                     currency = "uzs"
-                else:
-                    currency = "usd"
-            elif "$" in match.group(0):
-                currency = "usd"
-            else:
-                # Эвристика: большие числа скорее всего в сумах
-                if price and price > 10000:
-                    currency = "uzs"
-                else:
-                    currency = "usd"
             
-            break
+            # Эвристика: большие числа скорее всего в сумах
+            if price > 50000:
+                currency = "uzs"
+            
+            # Валидация цены
+            if currency == "usd" and 50 <= price <= 10000:
+                return price, currency
+            elif currency == "uzs" and price >= 100000:
+                return price, currency
     
-    if price is None:
-        return None, None, None
-    
-    # Определяем период
-    text_lower = text.lower()
-    if any(x in text_lower for x in ["в месяц", "месяц", "ежемесячно", "/мес", "oyiga", "ойига"]):
-        period = "month"
-    elif any(x in text_lower for x in ["в сутки", "сутки", "посуточно", "/сут", "sutkasiga"]):
-        period = "day"
-    elif deal_type == "sale":
-        period = "total"
-    else:
-        period = "month"  # по умолчанию для аренды
-    
-    return price, currency, period
+    return None, None
 
 
 def parse_deposit(text: str) -> Tuple[Optional[int], bool]:
-    """Извлекает депозит и флаг его отсутствия."""
-    text_lower = text.lower()
+    """Извлекает депозит и проверяет 'без депозита'."""
+    # Проверяем "без депозита"
+    if NO_DEPOSIT_PATTERN.search(text):
+        return None, True
     
-    # Проверяем "без депозита/залога"
-    if re.search(r'без\s+(?:депозит|залог)', text_lower):
-        return None, True  # no_deposit = True
-    
+    # Ищем сумму депозита
     for pattern in DEPOSIT_PATTERNS:
         match = pattern.search(text)
-        if match and match.group(1):
+        if match:
             deposit = extract_number(match.group(1))
-            if deposit:
+            if deposit and 10 <= deposit <= 10000:
                 return deposit, False
+    
+    # Проверяем наличие слова "депозит" без суммы
+    if re.search(r'депозит|deposit', text, re.I):
+        return None, False  # депозит есть, но сумма не указана
     
     return None, False
 
 
-def parse_district(text: str) -> Optional[str]:
-    """Извлекает район."""
-    match = match_first(DISTRICT_PATTERNS, text)
-    if match:
-        district = match.group(1).strip()
-        # Очищаем от лишних символов
-        district = re.sub(r'[#_]', ' ', district).strip()
-        return district
+def parse_district(text: str, hashtags: List[str] = None) -> Optional[str]:
+    """Извлекает и нормализует район."""
+    # Сначала ищем явное упоминание района в тексте
+    # "Мирабадский район", "Мирзо-Улугбекский район"
+    district_mention = re.search(r'([А-ЯЁа-яё\-]+(?:ский|ий))\s+район', text, re.I)
+    if district_mention:
+        district = normalize_district(district_mention.group(1))
+        if district:
+            return district
+    
+    # Ищем формат "📍 Район: Мирзо Улугбекский"
+    district_label = re.search(r'район\s*[:\-–]\s*([А-ЯЁа-яё\s\-]+?)(?:\s*[,\n📍🎯🏢]|$)', text, re.I)
+    if district_label:
+        district = normalize_district(district_label.group(1))
+        if district:
+            return district
+    
+    # Проверяем хештеги (но не все подряд, а только похожие на районы)
+    for tag in (hashtags or []):
+        tag_lower = tag.lower().replace('_', ' ')
+        # Пропускаем явно не районы
+        if any(x in tag_lower for x in ['комнат', 'долл', 'oila', 'qiz', 'boll']):
+            continue
+        district = normalize_district(tag)
+        if district:
+            return district
+    
+    # Ищем узбекский формат "TUMANI"
+    uz_district = re.search(r"([A-Za-z'\s]+)\s+tumani", text, re.I)
+    if uz_district:
+        district = normalize_district(uz_district.group(1))
+        if district:
+            return district
+    
     return None
 
 
@@ -447,223 +546,307 @@ def parse_metro(text: str) -> Optional[str]:
     """Извлекает станцию метро."""
     match = match_first(METRO_PATTERNS, text)
     if match:
-        metro = match.group(1).strip()
-        metro = re.sub(r'[#_]', ' ', metro).strip()
-        # Убираем слова типа "рядом", "около" в конце
-        metro = re.sub(r'\s+(рядом|около|близко)$', '', metro, flags=re.I)
-        return metro
+        return normalize_metro(match.group(1))
     return None
 
 
-def parse_landmark(text: str) -> Optional[str]:
-    """Извлекает ориентир/адрес."""
-    match = match_first(LANDMARK_PATTERNS, text)
-    if match:
-        return match.group(1).strip()
-    return None
+def parse_address(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """Извлекает адрес и ориентир."""
+    address = None
+    landmark = None
+    
+    # Ищем адрес
+    for pattern in ADDRESS_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            raw = match.group(1).strip()
+            if len(raw) > 3:
+                if 'ориентир' in pattern.pattern.lower() or 'mo\'ljal' in pattern.pattern.lower():
+                    landmark = raw
+                else:
+                    address = raw
+                break
+    
+    # Ищем ЖК
+    jk_match = JK_PATTERN.search(text)
+    if jk_match:
+        jk_name = jk_match.group(1).strip()
+        if address:
+            address = f"ЖК {jk_name}, {address}"
+        else:
+            address = f"ЖК {jk_name}"
+    
+    return address, landmark
 
 
-def parse_min_period(text: str) -> Optional[int]:
-    """Извлекает минимальный срок аренды в месяцах."""
-    match = match_first(MIN_PERIOD_PATTERNS, text)
-    if match:
-        return extract_number(match.group(1))
-    return None
-
-
-def parse_utilities_included(text: str) -> Optional[bool]:
-    """Определяет, включена ли коммуналка."""
-    match = match_first(UTILITIES_PATTERNS, text)
-    if match:
-        value = match.group(1).lower()
-        if any(x in value for x in ["включен", "входит"]):
-            return True
-        if any(x in value for x in ["отдельно", "не входит", "не включен"]):
-            return False
-    return None
+def parse_commission(text: str) -> Tuple[bool, Optional[int]]:
+    """Определяет наличие и размер комиссии."""
+    # Проверяем "без комиссии"
+    for pattern in NO_COMMISSION_PATTERNS:
+        if pattern.search(text):
+            return False, None
+    
+    # Ищем размер комиссии
+    for pattern in COMMISSION_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            pct = None
+            if match.lastindex and match.lastindex >= 1 and match.group(1):
+                pct = extract_number(match.group(1))
+            return True, pct
+    
+    return False, None
 
 
 def parse_condition(text: str) -> Optional[str]:
     """Извлекает состояние/ремонт."""
-    match = match_first(CONDITION_PATTERNS, text)
-    if match:
-        return match.group(1).strip()
+    for pattern in CONDITION_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            cond = match.group(1).strip() if match.lastindex >= 1 else match.group(0).strip()
+            if len(cond) > 2:
+                return cond.lower().replace('  ', ' ')
     return None
 
 
 def parse_house_type(text: str) -> Optional[str]:
-    """Извлекает тип дома."""
-    match = match_first(HOUSE_TYPE_PATTERNS, text)
-    if match:
-        return match.group(1).strip()
+    """Определяет тип дома."""
+    for pattern in HOUSE_TYPE_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            raw = match.group(1).lower().strip() if match.lastindex >= 1 else match.group(0).lower()
+            if 'новостройка' in raw or 'novostroy' in raw:
+                return "новостройка"
+            if 'вторичн' in raw:
+                return "вторичка"
     return None
 
 
 def parse_amenities(text: str) -> Dict[str, bool]:
     """Извлекает удобства."""
-    amenities = {}
-    for key, keywords in AMENITIES_KEYWORDS.items():
-        amenities[key] = check_keywords(text, keywords)
-    return amenities
+    result = {}
+    for key, keywords in AMENITIES.items():
+        result[key] = check_any_keyword(text, keywords)
+    return result
 
 
-def extract_phones(text: str) -> List[str]:
-    """Извлекает телефонные номера."""
-    if not text:
-        return []
-    phones = PHONE_RE.findall(text)
-    # Нормализуем и убираем дубликаты
-    normalized = set()
-    for phone in phones:
-        clean = re.sub(r'[\s\-\(\)]', '', phone)
-        if len(clean) >= 9:  # минимальная длина номера
-            normalized.add(clean)
-    return list(normalized)
+def parse_tenant_type(text: str) -> List[str]:
+    """Определяет кому сдаётся."""
+    result = []
+    for tenant_type, keywords in TENANT_PATTERNS.items():
+        if check_any_keyword(text, keywords):
+            result.append(tenant_type)
+    return result
+
+
+def detect_deal_type(text: str, hashtags: List[str] = None) -> str:
+    """Определяет тип сделки."""
+    t = text.lower()
+    tags = ' '.join(h.lower() for h in (hashtags or []))
+    
+    # Поиск жилья
+    if any(x in t for x in ['сниму', 'ищу квартиру', 'ищу комнату', 'нужна квартира']):
+        return 'wanted_rent'
+    if 'куплю' in t:
+        return 'wanted_buy'
+    
+    # Посуточно
+    if any(x in t for x in ['посуточно', 'сутки', 'sutka']):
+        return 'rent_daily'
+    
+    # Продажа
+    if any(x in t for x in ['продам', 'продаю', 'продажа', 'sotiladi']) or 'продажа' in tags:
+        return 'sale'
+    
+    # Аренда (по умолчанию)
+    return 'rent_long'
+
+
+def detect_object_type(text: str, rooms: Optional[int] = None) -> str:
+    """Определяет тип объекта."""
+    t = text.lower()
+    
+    if any(x in t for x in ['студия', 'studio']):
+        return 'studio'
+    
+    # Проверяем "комната" только если это не "X-комнатная квартира"
+    if re.search(r'\bкомнат[уа]\b', t) and not re.search(r'\d+\s*[–\-]?\s*комнат', t):
+        return 'room'
+    
+    # Дом/коттедж - но не "тип дома", "этажей в доме"
+    if re.search(r'(?:котедж|коттедж|частный\s+дом|hovli)', t):
+        return 'house'
+    if re.search(r'\bдом\b', t) and not re.search(r'тип\s+дома|в\s+доме|этажей\s+в\s+доме', t):
+        return 'house'
+    
+    if any(x in t for x in ['участок', 'соток', 'yer']):
+        return 'land'
+    
+    if any(x in t for x in ['офис', 'коммерч']):
+        return 'commercial'
+    
+    return 'flat'
+
+
+def detect_is_real_estate(text: str, hashtags: List[str] = None) -> bool:
+    """Определяет, является ли это объявлением о недвижимости."""
+    t = text.lower()
+    tags = ' '.join(h.lower() for h in (hashtags or []))
+    
+    # Ключевые слова недвижимости
+    keywords = [
+        'квартир', 'комнат', 'аренда', 'сдается', 'сдаётся', 'сдам',
+        'этаж', 'депозит', 'комисс', 'риелтор', 'маклер',
+        'xona', 'ijara', 'kvartira', 'narx', 'maklerskiy'
+    ]
+    
+    if any(k in t for k in keywords):
+        return True
+    
+    if any(k in tags for k in ['аренда', 'квартира', 'rent']):
+        return True
+    
+    # Формат X/X/X
+    if TRIPLE_FORMAT.search(text):
+        return True
+    
+    # Цена в долларах
+    if re.search(r'\d{2,4}\s*\$', t):
+        return True
+    
+    return False
+
+
+def extract_hashtags(text: str) -> List[str]:
+    """Извлекает хештеги из текста."""
+    return re.findall(r'#([А-ЯЁа-яёA-Za-z0-9_]+)', text)
 
 
 def clean_description(text: str) -> str:
-    """
-    Создает чистое описание, убирая технические данные.
-    Оставляет только человекочитаемый текст.
-    """
+    """Создаёт чистое описание без технических данных."""
     if not text:
         return ""
     
     result = text
     
     # Убираем технические паттерны
-    for pattern in TECHNICAL_PATTERNS:
-        result = re.sub(pattern, ' ', result, flags=re.I)
-    
-    # Дополнительные паттерны для очистки
-    extra_patterns = [
-        r'район\s*[,:]?',
-        r'метро\s+[А-Яа-яЁё]+\s*',
-        r'ор-р\s+[^\n◆,]+',
-        r'ориентир\s*[:\-–]?\s*[^\n◆,]+',
-        r'площадь\s+кв\.?метр\s*[:\-–]?\s*\d+',
-        r'[А-Яа-яЁё]+ский\s+район',
-        r'вторичн\w*\s*фонд',
-        r'новостройка',
+    patterns_to_remove = [
+        r'#\S+',  # хештеги
+        r'[⚫🟠🔴🔹🔸💮📍🎯🏡💸📐⏫🔼♦️📣☎️✏️📲🔑✉️👉🪧☑️🔎🏷💵📱🔵📝🔗✅🎖💰⛳️👤🔥💎🏢]',  # эмодзи
+        r'\+998[\d\s\-]+',  # телефоны
+        r't\.me/\S+',  # ссылки telegram
+        r'https?://\S+',  # ссылки
+        r'@\S+',  # юзернеймы
+        r'ID\s*[:\-]?\s*\d+',  # ID объявления
+        r'\d+/\d+/\d+',  # формат X/X/X
+        r'комисс\w*\s*\d*\s*%?[^\n]*',  # информация о комиссии
+        r'maklerskiy[^\n]*',
+        r'риелтор[^\n]*',
     ]
-    for pattern in extra_patterns:
+    
+    for pattern in patterns_to_remove:
         result = re.sub(pattern, ' ', result, flags=re.I)
     
-    # Убираем строки, состоящие только из цифр и знаков препинания
+    # Убираем строки с техническими данными
     lines = result.split('\n')
     clean_lines = []
+    
     for line in lines:
         line = line.strip()
-        # Пропускаем пустые строки и строки только с цифрами/символами
         if not line:
             continue
-        if re.match(r'^[\d\s\-\+\(\)\.,:;/\\◆◇●•]+$', line):
+        # Пропускаем строки только с цифрами/символами
+        if re.match(r'^[\d\s\-\+\(\)\.,:;/\\]+$', line):
             continue
-        # Пропускаем очень короткие строки (менее 15 символов)
-        if len(line) < 15:
+        # Пропускаем короткие строки
+        if len(line) < 10:
             continue
-        # Пропускаем строки, которые выглядят как технические данные
-        if re.match(r'^[А-Яа-яЁё\s]+\s*[:\-–]\s*[\d\w]+$', line):
+        # Пропускаем технические строки
+        if re.match(r'^[А-Яа-яЁё\s]+\s*[:\-–]\s*\d+', line):
             continue
         clean_lines.append(line)
     
-    result = '\n'.join(clean_lines)
+    result = ' '.join(clean_lines)
+    result = re.sub(r'\s+', ' ', result).strip()
     
-    # Финальная очистка
-    result = re.sub(r'[ \t]+', ' ', result)  # множественные пробелы
-    result = re.sub(r'\n\s*\n+', '\n', result)  # множественные переносы
-    result = result.strip()
-    
-    # Если осталось слишком мало текста, возвращаем пустую строку
-    if len(result) < 20:
-        return ""
-    
-    return result
+    return result if len(result) >= 20 else ""
 
 
 # ============================================
-# MAIN PARSING FUNCTION
+# MAIN PARSER FUNCTION
 # ============================================
 
-def parse_real_estate(text: str, hashtags: List[str] = None) -> Dict[str, Any]:
+def parse_listing(text: str, hashtags: List[str] = None) -> Dict[str, Any]:
     """
-    Главная функция парсинга объявления о недвижимости.
+    Главная функция парсинга объявления.
     
-    Возвращает словарь со всеми извлеченными данными.
+    Args:
+        text: Сырой текст объявления
+        hashtags: Список хештегов (опционально)
+    
+    Returns:
+        Словарь с распарсенными данными
     """
-    text = text or ""
-    hashtags = hashtags or []
-    text_norm = normalize_text(text)
-    
-    if not text_norm:
+    if not text:
         return {"is_real_estate": False}
+    
+    text = text.strip()
+    hashtags = hashtags or extract_hashtags(text)
     
     # Проверяем, является ли это объявлением о недвижимости
-    if not detect_is_real_estate(text_norm, hashtags):
+    if not detect_is_real_estate(text, hashtags):
         return {"is_real_estate": False}
     
-    # Определяем тип сделки и объекта
-    deal_type = detect_deal_type(text_norm, hashtags)
-    object_type = detect_object_type(text_norm, hashtags)
-    
-    # Парсим комнаты/этаж/этажность из формата X/X/X
-    rooms, floor, total_floors = parse_rooms_floor_triple(text_norm)
+    # Парсим формат X/X/X
+    rooms, floor, total_floors = parse_triple_format(text)
     
     # Если не нашли в тройном формате, парсим отдельно
     if rooms is None:
-        rooms = parse_rooms(text_norm)
+        rooms = parse_rooms(text)
     
     if floor is None or total_floors is None:
-        parsed_floor, parsed_total = parse_floor(text_norm)
+        f, tf = parse_floor(text)
         if floor is None:
-            floor = parsed_floor
+            floor = f
         if total_floors is None:
-            total_floors = parsed_total
+            total_floors = tf
     
-    # Площадь
-    area = parse_area(text_norm)
-    
-    # Цена
-    price, currency, price_period = parse_price(text_norm, deal_type)
-    
-    # Депозит
-    deposit, no_deposit = parse_deposit(text_norm)
-    
-    # Локация
-    district = parse_district(text_norm)
-    metro = parse_metro(text_norm)
-    landmark = parse_landmark(text_norm)
-    
-    # Условия аренды
-    min_period = parse_min_period(text_norm)
-    utilities_included = parse_utilities_included(text_norm)
-    
-    # Состояние
-    condition = parse_condition(text_norm)
-    house_type = parse_house_type(text_norm)
-    
-    # Удобства
-    amenities = parse_amenities(text_norm)
-    
-    # Телефоны
+    # Остальные поля
+    area = parse_area(text)
+    price, currency = parse_price(text)
+    deposit, no_deposit = parse_deposit(text)
+    district = parse_district(text, hashtags)
+    metro = parse_metro(text)
+    address, landmark = parse_address(text)
+    has_commission, commission_pct = parse_commission(text)
+    condition = parse_condition(text)
+    house_type = parse_house_type(text)
+    amenities = parse_amenities(text)
+    tenant_types = parse_tenant_type(text)
     phones = extract_phones(text)
+    deal_type = detect_deal_type(text, hashtags)
+    object_type = detect_object_type(text, rooms)
+    description = clean_description(text)
     
-    # Чистое описание
-    description_clean = clean_description(text)
-    
-    # Комиссия
-    has_commission = any(x in text_norm.lower() for x in [
-        "комиссионные", "комиссия", "maklerskiy", "риелтор", "риэлтор", "агент"
-    ])
+    # Рассчитываем качество парсинга
+    parse_score = 0
+    if rooms: parse_score += 2
+    if floor: parse_score += 1
+    if total_floors: parse_score += 1
+    if area: parse_score += 1
+    if price: parse_score += 3
+    if district: parse_score += 2
+    if metro: parse_score += 1
+    if phones: parse_score += 1
     
     return {
         "is_real_estate": True,
         
-        # Тип сделки и объекта
+        # Тип сделки
         "deal_type": deal_type,
         "object_type": object_type,
         
-        # Основные параметры
+        # Параметры объекта
         "rooms": rooms,
         "floor": floor,
         "total_floors": total_floors,
@@ -672,7 +855,7 @@ def parse_real_estate(text: str, hashtags: List[str] = None) -> Dict[str, Any]:
         # Цена
         "price": price,
         "currency": currency,
-        "price_period": price_period,
+        "price_period": "day" if deal_type == "rent_daily" else "month",
         
         # Депозит
         "deposit": deposit,
@@ -681,33 +864,32 @@ def parse_real_estate(text: str, hashtags: List[str] = None) -> Dict[str, Any]:
         # Локация
         "district_raw": district,
         "metro_raw": metro,
+        "address_raw": address,
         "landmark": landmark,
         
-        # Условия
-        "min_period_months": min_period,
-        "utilities_included": utilities_included,
+        # Комиссия
         "has_commission": has_commission,
+        "commission_pct": commission_pct,
         
         # Состояние
         "condition": condition,
         "house_type": house_type,
         
         # Удобства
-        "has_furniture": amenities.get('furniture', False),
-        "has_conditioner": amenities.get('conditioner', False),
-        "has_washing_machine": amenities.get('washing_machine', False),
-        "has_refrigerator": amenities.get('refrigerator', False),
-        "has_internet": amenities.get('internet', False),
-        "has_parking": amenities.get('parking', False),
-        "has_balcony": amenities.get('balcony', False),
-        "pets_allowed": amenities.get('pets_allowed', False),
-        "kids_allowed": amenities.get('kids_allowed', False),
+        **{f"has_{k.replace('has_', '')}": v for k, v in amenities.items()},
+        
+        # Кому сдаётся
+        "tenant_types": tenant_types,
         
         # Контакты
         "phones": phones,
         
-        # Чистое описание
-        "description_clean": description_clean,
+        # Описание
+        "description_clean": description,
+        
+        # Метаданные
+        "parse_score": parse_score,
+        "needs_review": parse_score < 5,
     }
 
 
@@ -716,24 +898,76 @@ def parse_real_estate(text: str, hashtags: List[str] = None) -> Dict[str, Any]:
 # ============================================
 
 if __name__ == "__main__":
-    # Тестовый текст из скриншота
-    test_text = """#Мирабадский район,Метро Ойбек Ор-р Точка вкуса ◆ Тип дома:Вторичный фонд ◆ Кол-во комнат: 1
-◆ Этаж: 3 ◆ Этажность: 4 ◆ Площадь кв.метр:35 ◆ Цена: 650$|Депозит|Предоплата ◆ Состояние:Новый
-ремонт ID:11355 Комиссионные 50% от первого месяца
+    test_cases = [
+        """⛳️  Manzil-Адрес
+МАССИВ ЯЛАНГАЧ ПАРК ЛОКОМАТИВ 
 
-Светлая уютная квартира в центре города. Рядом метро, магазины, кафе.
-Полностью меблирована, есть кондиционер и стиральная машина.
-Подходит для семейной пары или одного человека.
+  Xonalar-Комнаты
+⚫️🟠  1/4/4  🟠⚫️
 
-+998 90 123 45 67
-@landlord_tashkent"""
+👤 Kimga-Кому 
+Семья ЗАГС или Одиночка Порядочные
 
-    result = parse_real_estate(test_text, ["#аренда", "#квартира", "#мирабад"])
+💰 Narx-Цена: 350$+300$ Депозит 
+
+🎖 Maklerskiy-Коммисия  (50%)
+
+☎️ Tel: 903335552
+
+#Мирзо_Улугбек      #2979""",
+
+        """#Чиланзарский район,7-квартал
+Ор-р Hi-Tech Мечеть
+🔹Тип дома:Вторичный фонд
+🔹Кол-во комнат: 2*3
+🔹Этаж: 
+🔹Этажность: 4
+🔹Площадь кв.метр:55
+🔹Цена: 600$ 
+🔷Состояние:Евроремонт 
+ID:12399
+Комиссионные 50% от первого месяца""",
+
+        """🟣Мирабадский район
+     Новостройка 
+     Премиум класса
+    ЖК Mirabad avenue
+
+📱Ориентир: Мирабадский рынок
+
+🔸Комнат: 2
+🔸Этаж: 6
+🔸Этажей в доме: 13
+🔸Общая площадь: 55 м² 
+
+Цена: 1000 
+
+🔗@Tasha16 | +998903257308""",
+
+        """IJARAGA KVARTIRA ✅
+TARTIBLI INSONLARGA ✅
+#OILAGA | #QIZLARGA | #BOLLARGA ✅
+
+Manzil: MIRZO ULUG'BEK TUMANI, QORASUV-6
+
+Xonalar soni: 1 XONA 3/3
+
+Sharoiti: KIRMOSHINA, KONDITSIONER, MUZLATGICH, TELEVIZOR
+
+Narx: 350 $
+
+Tel.: 📞 +998937576775 EGASI ✅
+
+BEZMAKLER ✅""",
+    ]
     
-    print("=" * 60)
-    print("РЕЗУЛЬТАТ ПАРСИНГА:")
-    print("=" * 60)
-    for key, value in result.items():
-        if value is not None and value != "" and value != False:
-            print(f"{key}: {value}")
-    print("=" * 60)
+    for i, text in enumerate(test_cases, 1):
+        print(f"\n{'='*60}")
+        print(f"ТЕСТ {i}:")
+        print('='*60)
+        
+        result = parse_listing(text)
+        
+        for key, value in result.items():
+            if value is not None and value != "" and value != False and value != []:
+                print(f"  {key}: {value}")

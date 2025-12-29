@@ -22,6 +22,7 @@ from core.registry import ChannelRegistry
 from core.utils import env, ensure_dirs
 from database import post_service, init_db, close_db
 from services.parser import parse_real_estate, extract_phones
+from services.parser import parse_listing as parse_real_estate, extract_phones
 
 
 
