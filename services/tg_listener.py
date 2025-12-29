@@ -21,8 +21,7 @@ from telethon.tl.types import (
 from core.registry import ChannelRegistry
 from core.utils import env, ensure_dirs
 from database import post_service, init_db, close_db
-from services.parser import parse_real_estate, extract_phones
-from services.parser import parse_listing as parse_real_estate, extract_phones
+from services.parser import parse_listing, extract_phones
 
 
 
@@ -525,7 +524,7 @@ async def run_listener():
                 print(f"[media] download error chat={chat_id} msg={msg.id}: {e}")
 
         post_text = msg.message or ""
-        parsed = parse_real_estate(post_text, tags)
+        parsed = parse_listing(post_text, tags)
 
         post_data = {
             "post_uid": f"msg:{chat_id}:{int(msg.id)}",
@@ -605,7 +604,7 @@ async def run_listener():
 
         links, tags, mentions, cashtags = extract_links_tags_mentions(main_msg)
         post_text = main_msg.message or ""
-        parsed = parse_real_estate(post_text, tags)
+        parsed = parse_listing(post_text, tags)
         grouped_id = int(main_msg.grouped_id) if main_msg.grouped_id else None
 
         first_media_type = media_items[0]["media_type"] if media_items else None

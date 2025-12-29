@@ -5,6 +5,7 @@
 """
 from datetime import datetime
 from typing import Optional, List, Dict, Any
+from datetime import datetime, timezone  # добавить timezone
 
 from database.connection import get_session
 from database.repository import ChannelRepo, PostRepo, MediaRepo, ListingRepo, DuplicateRepo
@@ -98,11 +99,18 @@ class PostService:
 
     async def _check_duplicates(self, post_repo: PostRepo, dup_repo: DuplicateRepo, post):
         """Проверяет пост на дубликаты и связывает."""
+        def normalize_dt(dt):
+            """Нормализует datetime для сравнения"""
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=timezone.utc)
+            return dt
         # Точные дубли по хэшу текста
         if post.text_hash:
             duplicates = await post_repo.find_duplicates_by_hash(post.text_hash, exclude_id=post.id)
             for dup in duplicates:
                 # Оригинал — самый ранний
+                post_time = normalize_dt(post.published_at)
+                dup_time = normalize_dt(dup.published_at)
                 original = dup if dup.published_at < post.published_at else post
                 duplicate = post if dup.published_at < post.published_at else dup
                 
@@ -123,7 +131,8 @@ class PostService:
                 # Не создаём дубль если уже есть exact match
                 if post.duplicate_of:
                     continue
-                    
+                post_time = normalize_dt(post.published_at)
+                match_time = normalize_dt(match.published_at)
                 await dup_repo.create(
                     original_id=match.id if match.published_at < post.published_at else post.id,
                     duplicate_id=post.id if match.published_at < post.published_at else match.id,
@@ -199,13 +208,14 @@ class PostService:
 
     @staticmethod
     def _parse_date(date_str: Optional[str]) -> datetime:
-        """Парсит дату из строки или возвращает текущую."""
+        """Парсит дату из строки или возвращает текущую с timezone."""
         if not date_str:
-            return datetime.utcnow()
+            return datetime.now(timezone.utc)  # было: datetime.utcnow()
         try:
-            return datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+            dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+            return dt.replace(tzinfo=timezone.utc)  # добавляем timezone
         except ValueError:
-            return datetime.utcnow()
+            return datetime.now(timezone.utc)
 
 
 # Singleton для удобства
