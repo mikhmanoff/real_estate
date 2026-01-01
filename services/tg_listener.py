@@ -5,7 +5,7 @@ Telegram listener с сохранением в PostgreSQL.
 import asyncio
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from telethon import TelegramClient, events, utils
@@ -533,7 +533,7 @@ async def run_listener():
             "channel_id": chat_id,
             "chat_type": get_chat_type(chat),
             "date_utc": msg.date.strftime("%Y-%m-%d %H:%M:%S"),
-            "fetched_at_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "fetched_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "media_type": media_kind,
             "saved_path": saved_path,
             "media": None,
@@ -618,7 +618,7 @@ async def run_listener():
             "channel_id": chat_id,
             "chat_type": get_chat_type(chat),
             "date_utc": main_msg.date.strftime("%Y-%m-%d %H:%M:%S"),
-            "fetched_at_utc": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "fetched_at_utc": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
             "media_type": first_media_type,
             "saved_path": first_saved_path,
             "media": media_items,
