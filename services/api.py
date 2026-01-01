@@ -2,10 +2,11 @@
 """
 REST API для Telegram Mini App.
 """
+import os
 from typing import Optional, List
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pathlib import Path
 from pydantic import BaseModel
 from decimal import Decimal
@@ -14,13 +15,15 @@ from database import get_session, PostRepo, ListingRepo, MediaRepo
 from sqlalchemy import select, and_, or_, func
 from database.models import Post, Listing, Media, Channel, District, MetroStation
 
-app = FastAPI(title="Rent Finder API", version="1.0.0")
+app = FastAPI(title="Rent Finder API")
+DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/app/downloads"))
 
-# Монтируем папку с медиа
+
+""" # Монтируем папку с медиа
 DOWNLOAD_DIR = Path("/home/mikhmanoff/project/downloads")
 if DOWNLOAD_DIR.exists():
     app.mount("/media", StaticFiles(directory=str(DOWNLOAD_DIR)), name="media")
-
+ """
 # CORS для Mini App
 app.add_middleware(
     CORSMiddleware,
@@ -82,7 +85,6 @@ class ListingResponse(BaseModel):
     class Config:
         from_attributes = True
 
-
 class ListingsPageResponse(BaseModel):
     items: List[ListingResponse]
     total: int
@@ -118,6 +120,37 @@ class StatsResponse(BaseModel):
 @app.get("/")
 async def root():
     return {"status": "ok", "service": "Rent Finder API"}
+
+
+# Кастомный endpoint для медиа с CORS
+@app.get("/media/{channel_id}/{filename}")
+async def get_media(channel_id: str, filename: str):
+    """Отдаёт медиа файлы с CORS заголовками."""
+    file_path = DOWNLOAD_DIR / channel_id / filename
+    
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Определяем content-type
+    suffix = file_path.suffix.lower()
+    media_types = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg", 
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".mp4": "video/mp4",
+    }
+    media_type = media_types.get(suffix, "application/octet-stream")
+    
+    return FileResponse(
+        file_path,
+        media_type=media_type,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=86400"
+        }
+    )
 
 
 @app.get("/api/listings", response_model=ListingsPageResponse)
@@ -305,7 +338,11 @@ async def get_listing(listing_id: int):
         # Get photos
         media_query = select(Media).where(Media.post_id == post.id)
         media_result = await session.execute(media_query)
-        photos = [f"/media/{m.local_path.split('/')[-1]}" for m in media_result.scalars() if m.local_path]
+        photos = []
+        for m in media_result.scalars():
+            if m.local_path:
+                parts = m.local_path.split('/')
+                photos.append(f"/media/{parts[-2]}/{parts[-1]}")
         
         return ListingResponse(
             id=listing.id,
