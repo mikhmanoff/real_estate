@@ -1,5 +1,5 @@
 # Telegram
-telethon==1.36.0
+telethon==1.37.0
 
 # Web API
 fastapi==0.115.5
