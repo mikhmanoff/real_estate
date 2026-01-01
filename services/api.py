@@ -10,8 +10,6 @@ from fastapi.responses import FileResponse
 from pathlib import Path
 from pydantic import BaseModel
 from decimal import Decimal
-from pathlib import Path
-
 
 from database import get_session, PostRepo, ListingRepo, MediaRepo
 from sqlalchemy import select, and_, or_, func
@@ -271,13 +269,11 @@ async def get_listings(
                     "photos": []
                 }
             if media and media.local_path:
-            # Проверяем что файл реально существует
-                file_path = DOWNLOAD_DIR / media.local_path.split('/')[-2] / media.local_path.split('/')[-1]
-                if file_path.exists():
-                    parts = media.local_path.split('/')
-                    photo_url = f"/media/{parts[-2]}/{parts[-1]}"
-                    if photo_url not in listings_map[listing.id]["photos"]:
-                        listings_map[listing.id]["photos"].append(photo_url)
+                # Convert local path to URL (настроить под свой CDN/static)
+                parts = media.local_path.split('/')
+                photo_url = f"/media/{parts[-2]}/{parts[-1]}"
+                if photo_url not in listings_map[listing.id]["photos"]:
+                    listings_map[listing.id]["photos"].append(photo_url)
         
         # Build response
         items = []
