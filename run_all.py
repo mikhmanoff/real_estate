@@ -5,7 +5,7 @@ from core.utils import env
 
 async def run_registry_api():
     """Registry API на порту 8000."""
-    host = env("HOST", "127.0.0.1")
+    host = "0.0.0.0"  # ← Важно! Не 127.0.0.1
     port = env("REGISTRY_PORT", "8000")
     cmd = ["uvicorn", "services.registry_api:app", "--host", host, "--port", port, "--reload"]
     proc = await asyncio.create_subprocess_exec(*cmd)
@@ -14,7 +14,7 @@ async def run_registry_api():
 
 async def run_main_api():
     """Main API для Mini App на порту 8001."""
-    host = env("HOST", "127.0.0.1")
+    host = "0.0.0.0"  # ← Важно! Не 127.0.0.1
     port = env("API_PORT", "8001")
     cmd = ["uvicorn", "services.api:app", "--host", host, "--port", port, "--reload"]
     proc = await asyncio.create_subprocess_exec(*cmd)
