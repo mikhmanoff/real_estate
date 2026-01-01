@@ -1,26 +1,39 @@
 # database/connection.py
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from core.utils import env
-
 
 def get_database_url() -> str:
-    """Формирует URL подключения к PostgreSQL из переменных окружения."""
-    return (
-        f"postgresql+asyncpg://"
-        f"{env('DB_USER', 'postgres')}:{env('DB_PASSWORD', 'postgres')}"
-        f"@{env('DB_HOST', 'localhost')}:{env('DB_PORT', '5432')}"
-        f"/{env('DB_NAME', 'tg_realty')}"
-    )
+    """Формирует URL подключения к PostgreSQL."""
+    
+    # Сначала проверяем DATABASE_URL (Railway, Render, Heroku)
+    database_url = os.getenv("DATABASE_URL")
+    
+    if database_url:
+        # Railway/Heroku дают postgres://, а asyncpg требует postgresql+asyncpg://
+        if database_url.startswith("postgres://"):
+            database_url = database_url.replace("postgres://", "postgresql+asyncpg://", 1)
+        elif database_url.startswith("postgresql://"):
+            database_url = database_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return database_url
+    
+    # Fallback на отдельные переменные (для локальной разработки)
+    user = os.getenv("DB_USER", "postgres")
+    password = os.getenv("DB_PASSWORD", "postgres")
+    host = os.getenv("DB_HOST", "localhost")
+    port = os.getenv("DB_PORT", "5432")
+    name = os.getenv("DB_NAME", "tg_realty")
+    
+    return f"postgresql+asyncpg://{user}:{password}@{host}:{port}/{name}"
 
 
 # Async engine
 engine = create_async_engine(
     get_database_url(),
-    echo=env("DB_ECHO", "false").lower() == "true",
+    echo=os.getenv("DB_ECHO", "false").lower() == "true",
     pool_size=5,
     max_overflow=10,
 )
