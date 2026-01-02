@@ -236,3 +236,20 @@ class Duplicate(Base):
     similarity: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4))
     match_type: Mapped[Optional[str]] = mapped_column(String(50))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now())
+    
+    
+class Favorite(Base):
+    """Избранные объявления пользователей Telegram"""
+    __tablename__ = "favorites"
+    __table_args__ = (
+        UniqueConstraint("telegram_user_id", "listing_id", name="uq_user_listing_favorite"),
+        Index("idx_favorites_user", "telegram_user_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    listing_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("listings.id", ondelete="CASCADE"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now())
+
+    # Relationship
+    listing: Mapped["Listing"] = relationship("Listing")
