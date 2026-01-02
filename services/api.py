@@ -3,6 +3,9 @@
 REST API для Telegram Mini App.
 """
 import os
+import hashlib
+import hmac
+from urllib.parse import parse_qs
 from typing import Optional, List
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,11 +16,12 @@ from decimal import Decimal
 
 from database import get_session, PostRepo, ListingRepo, MediaRepo
 from sqlalchemy import select, and_, or_, func
-from database.models import Post, Listing, Media, Channel, District, MetroStation
+from database.models import Post, Listing, Media, Channel, District, MetroStation, Favorite
+
 
 app = FastAPI(title="Rent Finder API")
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/app/downloads"))
-
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")  # Токен твоего бота
 
 """ # Монтируем папку с медиа
 DOWNLOAD_DIR = Path("/home/mikhmanoff/project/downloads")
@@ -32,6 +36,155 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def validate_telegram_data(init_data: str) -> Optional[int]:
+    """
+    Валидирует initData из Telegram и возвращает user_id.
+    Возвращает None если данные невалидны.
+    """
+    if not init_data or not BOT_TOKEN:
+        return None
+    
+    try:
+        parsed = parse_qs(init_data)
+        
+        # Получаем hash
+        received_hash = parsed.get('hash', [''])[0]
+        if not received_hash:
+            return None
+        
+        # Собираем строку для проверки
+        data_check_arr = []
+        for key, value in parsed.items():
+            if key != 'hash':
+                data_check_arr.append(f"{key}={value[0]}")
+        data_check_arr.sort()
+        data_check_string = '\n'.join(data_check_arr)
+        
+        # Создаём secret key
+        secret_key = hmac.new(
+            b"WebAppData", 
+            BOT_TOKEN.encode(), 
+            hashlib.sha256
+        ).digest()
+        
+        # Проверяем подпись
+        calculated_hash = hmac.new(
+            secret_key,
+            data_check_string.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        
+        if calculated_hash != received_hash:
+            return None
+        
+        # Извлекаем user_id из user JSON
+        import json
+        user_json = parsed.get('user', ['{}'])[0]
+        user_data = json.loads(user_json)
+        return user_data.get('id')
+        
+    except Exception as e:
+        print(f"Telegram validation error: {e}")
+        return None
+
+
+# ============================================
+# FAVORITES ENDPOINTS
+# ============================================
+
+@app.get("/api/favorites")
+async def get_favorites(
+    init_data: str = Query(..., description="Telegram initData"),
+):
+    """Получить список избранных объявлений пользователя."""
+    user_id = validate_telegram_data(init_data)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid Telegram auth")
+    
+    async with get_session() as session:
+        query = (
+            select(Favorite.listing_id)
+            .where(Favorite.telegram_user_id == user_id)
+        )
+        result = await session.execute(query)
+        favorite_ids = [row[0] for row in result.fetchall()]
+        
+        return {"favorites": favorite_ids}
+
+
+@app.post("/api/favorites/{listing_id}")
+async def add_favorite(
+    listing_id: int,
+    init_data: str = Query(..., description="Telegram initData"),
+):
+    """Добавить объявление в избранное."""
+    user_id = validate_telegram_data(init_data)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid Telegram auth")
+    
+    async with get_session() as session:
+        # Проверяем, существует ли listing
+        listing = await session.get(Listing, listing_id)
+        if not listing:
+            raise HTTPException(status_code=404, detail="Listing not found")
+        
+        # Проверяем, не добавлен ли уже
+        existing = await session.execute(
+            select(Favorite).where(
+                Favorite.telegram_user_id == user_id,
+                Favorite.listing_id == listing_id
+            )
+        )
+        if existing.scalar_one_or_none():
+            return {"status": "already_exists"}
+        
+        # Добавляем
+        favorite = Favorite(
+            telegram_user_id=user_id,
+            listing_id=listing_id
+        )
+        session.add(favorite)
+        
+        return {"status": "added"}
+
+
+@app.delete("/api/favorites/{listing_id}")
+async def remove_favorite(
+    listing_id: int,
+    init_data: str = Query(..., description="Telegram initData"),
+):
+    """Удалить объявление из избранного."""
+    user_id = validate_telegram_data(init_data)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid Telegram auth")
+    
+    async with get_session() as session:
+        result = await session.execute(
+            select(Favorite).where(
+                Favorite.telegram_user_id == user_id,
+                Favorite.listing_id == listing_id
+            )
+        )
+        favorite = result.scalar_one_or_none()
+        
+        if favorite:
+            await session.delete(favorite)
+            return {"status": "removed"}
+        
+        return {"status": "not_found"}
+
+
+@app.get("/api/favorites/count/{listing_id}")
+async def get_favorites_count(listing_id: int):
+    """Получить количество добавлений в избранное."""
+    async with get_session() as session:
+        result = await session.execute(
+            select(func.count(Favorite.id)).where(Favorite.listing_id == listing_id)
+        )
+        count = result.scalar() or 0
+        return {"count": count}
 
 
 # ============================================
