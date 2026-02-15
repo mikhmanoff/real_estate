@@ -3,6 +3,7 @@
 REST API для Telegram Mini App.
 """
 import os
+import json
 import hashlib
 import hmac
 from urllib.parse import parse_qs
@@ -23,6 +24,11 @@ app = FastAPI(title="Rent Finder API")
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/app/downloads"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")  # Токен твоего бота
 
+""" # Монтируем папку с медиа
+DOWNLOAD_DIR = Path("/home/mikhmanoff/project/downloads")
+if DOWNLOAD_DIR.exists():
+    app.mount("/media", StaticFiles(directory=str(DOWNLOAD_DIR)), name="media")
+ """
 # CORS для Mini App
 app.add_middleware(
     CORSMiddleware,
@@ -32,6 +38,89 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ============================================
+# RESPONSE MODELS (должны быть ДО эндпоинтов!)
+# ============================================
+
+class ListingResponse(BaseModel):
+    id: int
+    post_id: int
+    
+    # Price
+    price: Optional[float]
+    currency: Optional[str]
+    price_period: Optional[str]
+    deposit: Optional[float]
+    
+    # Basic info
+    rooms: Optional[int]
+    area: Optional[float]
+    floor: Optional[int]
+    total_floors: Optional[int]
+    
+    # Location
+    district: Optional[str]
+    metro: Optional[str]
+    address: Optional[str]
+    
+    # Features
+    deal_type: Optional[str]
+    object_type: Optional[str]
+    has_furniture: Optional[bool]
+    has_conditioner: Optional[bool]
+    has_commission: bool
+    
+    # Media
+    photos: List[str]
+    
+    # Text
+    description: Optional[str]
+    
+    # Contacts
+    phones: List[str]
+    
+    # Stats
+    views_today: int = 0
+    favorites_count: int = 0
+    
+    # Timestamps
+    published_at: str
+
+    class Config:
+        from_attributes = True
+
+class ListingsPageResponse(BaseModel):
+    items: List[ListingResponse]
+    total: int
+    page: int
+    page_size: int
+    has_more: bool
+
+
+class DistrictResponse(BaseModel):
+    id: int
+    name_ru: str
+    name_uz: Optional[str]
+
+
+class MetroResponse(BaseModel):
+    id: int
+    name_ru: str
+    name_uz: Optional[str]
+    line_name: Optional[str]
+    line_color: Optional[str]
+
+
+class StatsResponse(BaseModel):
+    total_listings: int
+    active_listings: int
+    channels_count: int
+
+
+# ============================================
+# HELPERS
+# ============================================
 
 def validate_telegram_data(init_data: str) -> Optional[int]:
     """
@@ -75,7 +164,6 @@ def validate_telegram_data(init_data: str) -> Optional[int]:
             return None
         
         # Извлекаем user_id из user JSON
-        import json
         user_json = parsed.get('user', ['{}'])[0]
         user_data = json.loads(user_json)
         return user_data.get('id')
@@ -320,85 +408,6 @@ async def get_favorites_count(listing_id: int):
 
 
 # ============================================
-# RESPONSE MODELS
-# ============================================
-
-class ListingResponse(BaseModel):
-    id: int
-    post_id: int
-    
-    # Price
-    price: Optional[float]
-    currency: Optional[str]
-    price_period: Optional[str]
-    deposit: Optional[float]
-    
-    # Basic info
-    rooms: Optional[int]
-    area: Optional[float]
-    floor: Optional[int]
-    total_floors: Optional[int]
-    
-    # Location
-    district: Optional[str]
-    metro: Optional[str]
-    address: Optional[str]
-    
-    # Features
-    deal_type: Optional[str]
-    object_type: Optional[str]
-    has_furniture: Optional[bool]
-    has_conditioner: Optional[bool]
-    has_commission: bool
-    
-    # Media
-    photos: List[str]
-    
-    # Text
-    description: Optional[str]
-    
-    # Contacts
-    phones: List[str]
-    
-    # Stats
-    views_today: int = 0
-    favorites_count: int = 0
-    
-    # Timestamps
-    published_at: str
-
-    class Config:
-        from_attributes = True
-
-class ListingsPageResponse(BaseModel):
-    items: List[ListingResponse]
-    total: int
-    page: int
-    page_size: int
-    has_more: bool
-
-
-class DistrictResponse(BaseModel):
-    id: int
-    name_ru: str
-    name_uz: Optional[str]
-
-
-class MetroResponse(BaseModel):
-    id: int
-    name_ru: str
-    name_uz: Optional[str]
-    line_name: Optional[str]
-    line_color: Optional[str]
-
-
-class StatsResponse(BaseModel):
-    total_listings: int
-    active_listings: int
-    channels_count: int
-
-
-# ============================================
 # ENDPOINTS
 # ============================================
 
@@ -407,12 +416,10 @@ async def root():
     return {"status": "ok", "service": "Rent Finder API"}
 
 
+# Кастомный endpoint для медиа с CORS
 @app.get("/media/{channel_id}/{filename}")
 async def get_media(channel_id: str, filename: str):
-    """
-    Отдаёт медиа файлы.
-    CORS обрабатывается middleware — не добавляем заголовки вручную.
-    """
+    """Отдаёт медиа файлы."""
     file_path = DOWNLOAD_DIR / channel_id / filename
     
     if not file_path.exists():
