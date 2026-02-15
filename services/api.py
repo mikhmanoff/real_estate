@@ -23,11 +23,6 @@ app = FastAPI(title="Rent Finder API")
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/app/downloads"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")  # Токен твоего бота
 
-""" # Монтируем папку с медиа
-DOWNLOAD_DIR = Path("/home/mikhmanoff/project/downloads")
-if DOWNLOAD_DIR.exists():
-    app.mount("/media", StaticFiles(directory=str(DOWNLOAD_DIR)), name="media")
- """
 # CORS для Mini App
 app.add_middleware(
     CORSMiddleware,
@@ -88,6 +83,35 @@ def validate_telegram_data(init_data: str) -> Optional[int]:
     except Exception as e:
         print(f"Telegram validation error: {e}")
         return None
+
+
+# ============================================
+# HELPER: Безопасное извлечение photo URL из local_path
+# ============================================
+
+def local_path_to_url(local_path: str) -> Optional[str]:
+    """
+    Конвертирует local_path из БД в URL для API.
+    
+    Примеры:
+      "/app/downloads/2002705045/2002705045_123.jpg" -> "/media/2002705045/2002705045_123.jpg"
+      "downloads/2002705045/file.jpg" -> "/media/2002705045/file.jpg"
+      "/home/user/project/downloads/123/file.jpg" -> "/media/123/file.jpg"
+    """
+    if not local_path:
+        return None
+    
+    path = Path(local_path)
+    
+    # Берём последние 2 компонента пути: channel_id/filename
+    parts = path.parts
+    if len(parts) < 2:
+        return None
+    
+    channel_dir = parts[-2]
+    filename = parts[-1]
+    
+    return f"/media/{channel_dir}/{filename}"
 
 
 # ============================================
@@ -275,10 +299,12 @@ async def root():
     return {"status": "ok", "service": "Rent Finder API"}
 
 
-# Кастомный endpoint для медиа с CORS
 @app.get("/media/{channel_id}/{filename}")
 async def get_media(channel_id: str, filename: str):
-    """Отдаёт медиа файлы с CORS заголовками."""
+    """
+    Отдаёт медиа файлы.
+    CORS обрабатывается middleware — не добавляем заголовки вручную.
+    """
     file_path = DOWNLOAD_DIR / channel_id / filename
     
     if not file_path.exists():
@@ -300,10 +326,40 @@ async def get_media(channel_id: str, filename: str):
         file_path,
         media_type=media_type,
         headers={
-            "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "public, max-age=86400"
+            "Cache-Control": "public, max-age=86400",
         }
     )
+
+
+# Диагностический эндпоинт — проверить состояние медиа
+@app.get("/api/debug/media-check")
+async def debug_media_check():
+    """Проверяет доступность медиа файлов на диске."""
+    if not DOWNLOAD_DIR.exists():
+        return {
+            "download_dir": str(DOWNLOAD_DIR),
+            "exists": False,
+            "error": "DOWNLOAD_DIR does not exist!"
+        }
+    
+    total_files = 0
+    total_size = 0
+    channels = {}
+    
+    for channel_dir in DOWNLOAD_DIR.iterdir():
+        if channel_dir.is_dir():
+            files = list(channel_dir.glob("*"))
+            channels[channel_dir.name] = len(files)
+            total_files += len(files)
+            total_size += sum(f.stat().st_size for f in files if f.is_file())
+    
+    return {
+        "download_dir": str(DOWNLOAD_DIR),
+        "exists": True,
+        "total_files": total_files,
+        "total_size_mb": round(total_size / 1024 / 1024, 2),
+        "channels": channels,
+    }
 
 
 @app.get("/api/listings", response_model=ListingsPageResponse)
@@ -353,7 +409,6 @@ async def get_listings(
                 if r == "studio":
                     room_list.append(0)
                 elif r.endswith("+"):
-                    # 4+ значит >= 4
                     pass  # handled separately
                 else:
                     try:
@@ -412,7 +467,7 @@ async def get_listings(
         result = await session.execute(query)
         rows = result.all()
         
-        # Group media by post_id
+        # Group media by listing
         listings_map = {}
         for listing, post, media in rows:
             if listing.id not in listings_map:
@@ -422,10 +477,8 @@ async def get_listings(
                     "photos": []
                 }
             if media and media.local_path:
-                # Convert local path to URL (настроить под свой CDN/static)
-                parts = media.local_path.split('/')
-                photo_url = f"/media/{parts[-2]}/{parts[-1]}"
-                if photo_url not in listings_map[listing.id]["photos"]:
+                photo_url = local_path_to_url(media.local_path)
+                if photo_url and photo_url not in listings_map[listing.id]["photos"]:
                     listings_map[listing.id]["photos"].append(photo_url)
         
         # Build response
@@ -454,8 +507,8 @@ async def get_listings(
                 has_furniture=listing.has_furniture,
                 has_conditioner=listing.has_conditioner,
                 has_commission=listing.has_commission,
-                photos=photos or ["https://via.placeholder.com/800x600?text=No+Photo"],
-                description=post.text_raw[:500] if post.text_raw else None,
+                photos=photos,  # Пустой список OK — фронт подставит placeholder
+                description=listing.description_clean or (post.text_raw[:500] if post.text_raw else None),
                 phones=post.phones or [],
                 views_today=0,  # TODO: реализовать счётчик
                 favorites_count=0,  # TODO: реализовать
@@ -494,8 +547,9 @@ async def get_listing(listing_id: int):
         photos = []
         for m in media_result.scalars():
             if m.local_path:
-                parts = m.local_path.split('/')
-                photos.append(f"/media/{parts[-2]}/{parts[-1]}")
+                photo_url = local_path_to_url(m.local_path)
+                if photo_url:
+                    photos.append(photo_url)
         
         return ListingResponse(
             id=listing.id,
@@ -516,8 +570,8 @@ async def get_listing(listing_id: int):
             has_furniture=listing.has_furniture,
             has_conditioner=listing.has_conditioner,
             has_commission=listing.has_commission,
-            photos=photos or ["https://via.placeholder.com/800x600?text=No+Photo"],
-            description=post.text_raw,
+            photos=photos,
+            description=listing.description_clean or post.text_raw,
             phones=post.phones or [],
             views_today=0,
             favorites_count=0,
