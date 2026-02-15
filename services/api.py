@@ -200,6 +200,114 @@ async def remove_favorite(
         return {"status": "not_found"}
 
 
+@app.get("/api/favorites/listings", response_model=ListingsPageResponse)
+async def get_favorite_listings(
+    init_data: str = Query(..., description="Telegram initData"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+):
+    """Получить полные данные избранных объявлений пользователя."""
+    user_id = validate_telegram_data(init_data)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid Telegram auth")
+    
+    async with get_session() as session:
+        # Получаем ID избранных
+        fav_query = (
+            select(Favorite.listing_id)
+            .where(Favorite.telegram_user_id == user_id)
+            .order_by(Favorite.created_at.desc())
+        )
+        fav_result = await session.execute(fav_query)
+        all_fav_ids = [row[0] for row in fav_result.fetchall()]
+        
+        total = len(all_fav_ids)
+        
+        if not all_fav_ids:
+            return ListingsPageResponse(
+                items=[], total=0, page=page, page_size=page_size, has_more=False
+            )
+        
+        # Пагинация по ID
+        start = (page - 1) * page_size
+        page_ids = all_fav_ids[start:start + page_size]
+        
+        if not page_ids:
+            return ListingsPageResponse(
+                items=[], total=total, page=page, page_size=page_size, has_more=False
+            )
+        
+        # Загружаем полные данные
+        query = (
+            select(Listing, Post, Media)
+            .join(Post, Listing.post_id == Post.id)
+            .outerjoin(Media, Media.post_id == Post.id)
+            .where(Listing.id.in_(page_ids))
+        )
+        
+        result = await session.execute(query)
+        rows = result.all()
+        
+        # Группируем медиа
+        listings_map = {}
+        for listing, post, media in rows:
+            if listing.id not in listings_map:
+                listings_map[listing.id] = {
+                    "listing": listing,
+                    "post": post,
+                    "photos": []
+                }
+            if media and media.local_path:
+                photo_url = local_path_to_url(media.local_path)
+                if photo_url and photo_url not in listings_map[listing.id]["photos"]:
+                    listings_map[listing.id]["photos"].append(photo_url)
+        
+        # Собираем ответ в порядке избранного (newest first)
+        items = []
+        for fav_id in page_ids:
+            if fav_id not in listings_map:
+                continue
+            data = listings_map[fav_id]
+            listing = data["listing"]
+            post = data["post"]
+            photos = data["photos"]
+            
+            items.append(ListingResponse(
+                id=listing.id,
+                post_id=post.id,
+                price=float(listing.price) if listing.price else None,
+                currency=listing.currency,
+                price_period=listing.price_period,
+                deposit=float(listing.deposit) if listing.deposit else None,
+                rooms=listing.rooms,
+                area=float(listing.area_m2) if listing.area_m2 else None,
+                floor=listing.floor,
+                total_floors=listing.total_floors,
+                district=listing.district_raw,
+                metro=listing.metro_raw,
+                address=listing.district_raw,
+                deal_type=listing.deal_type,
+                object_type=listing.object_type,
+                has_furniture=listing.has_furniture,
+                has_conditioner=listing.has_conditioner,
+                has_commission=listing.has_commission,
+                photos=photos,
+                description=listing.description_clean or (post.text_raw[:500] if post.text_raw else None),
+                phones=post.phones or [],
+                views_today=0,
+                favorites_count=0,
+                published_at=post.published_at.isoformat(),
+            ))
+        
+        return ListingsPageResponse(
+            items=items,
+            total=total,
+            page=page,
+            page_size=page_size,
+            has_more=(start + page_size) < total,
+        )
+
+
 @app.get("/api/favorites/count/{listing_id}")
 async def get_favorites_count(listing_id: int):
     """Получить количество добавлений в избранное."""
