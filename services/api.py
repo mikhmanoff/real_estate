@@ -17,18 +17,13 @@ from decimal import Decimal
 
 from database import get_session, PostRepo, ListingRepo, MediaRepo
 from sqlalchemy import select, and_, or_, func
-from database.models import Post, Listing, Media, Channel, District, MetroStation, Favorite
+from database.models import Post, Listing, Media, Channel, District, MetroStation, Favorite, ShareLog
 
 
 app = FastAPI(title="Rent Finder API")
 DOWNLOAD_DIR = Path(os.getenv("DOWNLOAD_DIR", "/app/downloads"))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")  # Токен твоего бота
 
-""" # Монтируем папку с медиа
-DOWNLOAD_DIR = Path("/home/mikhmanoff/project/downloads")
-if DOWNLOAD_DIR.exists():
-    app.mount("/media", StaticFiles(directory=str(DOWNLOAD_DIR)), name="media")
- """
 # CORS для Mini App
 app.add_middleware(
     CORSMiddleware,
@@ -40,7 +35,7 @@ app.add_middleware(
 
 
 # ============================================
-# RESPONSE MODELS (должны быть ДО эндпоинтов!)
+# RESPONSE MODELS
 # ============================================
 
 class ListingResponse(BaseModel):
@@ -173,25 +168,15 @@ def validate_telegram_data(init_data: str) -> Optional[int]:
         return None
 
 
-# ============================================
-# HELPER: Безопасное извлечение photo URL из local_path
-# ============================================
-
 def local_path_to_url(local_path: str) -> Optional[str]:
     """
     Конвертирует local_path из БД в URL для API.
-    
-    Примеры:
-      "/app/downloads/2002705045/2002705045_123.jpg" -> "/media/2002705045/2002705045_123.jpg"
-      "downloads/2002705045/file.jpg" -> "/media/2002705045/file.jpg"
-      "/home/user/project/downloads/123/file.jpg" -> "/media/123/file.jpg"
     """
     if not local_path:
         return None
     
     path = Path(local_path)
     
-    # Берём последние 2 компонента пути: channel_id/filename
     parts = path.parts
     if len(parts) < 2:
         return None
@@ -200,6 +185,66 @@ def local_path_to_url(local_path: str) -> Optional[str]:
     filename = parts[-1]
     
     return f"/media/{channel_dir}/{filename}"
+
+
+# ============================================
+# SHARE-TO-UNLOCK ENDPOINTS
+# ============================================
+
+@app.get("/api/shares/{listing_id}")
+async def get_share_count(
+    listing_id: int,
+    init_data: str = Query(..., description="Telegram initData"),
+):
+    """Получить количество шар пользователя для данного объявления."""
+    user_id = validate_telegram_data(init_data)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid Telegram auth")
+    
+    async with get_session() as session:
+        result = await session.execute(
+            select(ShareLog.share_count).where(
+                ShareLog.telegram_user_id == user_id,
+                ShareLog.listing_id == listing_id
+            )
+        )
+        row = result.scalar_one_or_none()
+        return {"count": row or 0, "required": 2}
+
+
+@app.post("/api/shares/{listing_id}")
+async def record_share(
+    listing_id: int,
+    init_data: str = Query(..., description="Telegram initData"),
+):
+    """Записать шару пользователя (инкремент счётчика)."""
+    user_id = validate_telegram_data(init_data)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Invalid Telegram auth")
+    
+    async with get_session() as session:
+        # Проверяем существующую запись
+        result = await session.execute(
+            select(ShareLog).where(
+                ShareLog.telegram_user_id == user_id,
+                ShareLog.listing_id == listing_id
+            )
+        )
+        existing = result.scalar_one_or_none()
+        
+        if existing:
+            existing.share_count += 1
+            count = existing.share_count
+        else:
+            share_log = ShareLog(
+                telegram_user_id=user_id,
+                listing_id=listing_id,
+                share_count=1
+            )
+            session.add(share_log)
+            count = 1
+        
+        return {"count": count, "unlocked": count >= 2}
 
 
 # ============================================
@@ -350,7 +395,7 @@ async def get_favorite_listings(
                 if photo_url and photo_url not in listings_map[listing.id]["photos"]:
                     listings_map[listing.id]["photos"].append(photo_url)
         
-        # Собираем ответ в порядке избранного (newest first)
+        # Собираем ответ в порядке избранного
         items = []
         for fav_id in page_ids:
             if fav_id not in listings_map:
@@ -416,7 +461,6 @@ async def root():
     return {"status": "ok", "service": "Rent Finder API"}
 
 
-# Кастомный endpoint для медиа с CORS
 @app.get("/media/{channel_id}/{filename}")
 async def get_media(channel_id: str, filename: str):
     """Отдаёт медиа файлы."""
@@ -425,7 +469,6 @@ async def get_media(channel_id: str, filename: str):
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
     
-    # Определяем content-type
     suffix = file_path.suffix.lower()
     media_types = {
         ".jpg": "image/jpeg",
@@ -446,7 +489,6 @@ async def get_media(channel_id: str, filename: str):
     )
 
 
-# Диагностический эндпоинт — проверить состояние медиа
 @app.get("/api/debug/media-check")
 async def debug_media_check():
     """Проверяет доступность медиа файлов на диске."""
@@ -524,7 +566,7 @@ async def get_listings(
                 if r == "studio":
                     room_list.append(0)
                 elif r.endswith("+"):
-                    pass  # handled separately
+                    pass
                 else:
                     try:
                         room_list.append(int(r))
@@ -616,17 +658,17 @@ async def get_listings(
                 total_floors=listing.total_floors,
                 district=listing.district_raw,
                 metro=listing.metro_raw,
-                address=listing.district_raw,  # TODO: улучшить
+                address=listing.district_raw,
                 deal_type=listing.deal_type,
                 object_type=listing.object_type,
                 has_furniture=listing.has_furniture,
                 has_conditioner=listing.has_conditioner,
                 has_commission=listing.has_commission,
-                photos=photos,  # Пустой список OK — фронт подставит placeholder
+                photos=photos,
                 description=listing.description_clean or (post.text_raw[:500] if post.text_raw else None),
                 phones=post.phones or [],
-                views_today=0,  # TODO: реализовать счётчик
-                favorites_count=0,  # TODO: реализовать
+                views_today=0,
+                favorites_count=0,
                 published_at=post.published_at.isoformat(),
             ))
         

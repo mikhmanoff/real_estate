@@ -116,8 +116,8 @@ class Listing(Base):
 
     # Classification
     is_real_estate: Mapped[bool] = mapped_column(Boolean, default=True)
-    deal_type: Mapped[Optional[str]] = mapped_column(String(50))  # rent_long, rent_daily, sale, wanted_rent
-    object_type: Mapped[Optional[str]] = mapped_column(String(50))  # flat, room, house, land, office
+    deal_type: Mapped[Optional[str]] = mapped_column(String(50))
+    object_type: Mapped[Optional[str]] = mapped_column(String(50))
 
     # Object parameters
     rooms: Mapped[Optional[int]] = mapped_column(SmallInteger)
@@ -137,7 +137,7 @@ class Listing(Base):
     district_raw: Mapped[Optional[str]] = mapped_column(String(255))
     metro_raw: Mapped[Optional[str]] = mapped_column(String(255))
     address_raw: Mapped[Optional[str]] = mapped_column(Text)
-    landmark: Mapped[Optional[str]] = mapped_column(String(255))  # NEW: Ориентир
+    landmark: Mapped[Optional[str]] = mapped_column(String(255))
 
     # Normalized location
     district_id: Mapped[Optional[int]] = mapped_column(Integer)
@@ -145,14 +145,14 @@ class Listing(Base):
     latitude: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 7))
     longitude: Mapped[Optional[Decimal]] = mapped_column(Numeric(10, 7))
 
-    # Rental conditions (NEW)
-    min_period_months: Mapped[Optional[int]] = mapped_column(SmallInteger)  # Мин. срок аренды
-    utilities_included: Mapped[Optional[bool]] = mapped_column(Boolean)  # Коммуналка включена
-    no_deposit: Mapped[bool] = mapped_column(Boolean, default=False)  # Без депозита
+    # Rental conditions
+    min_period_months: Mapped[Optional[int]] = mapped_column(SmallInteger)
+    utilities_included: Mapped[Optional[bool]] = mapped_column(Boolean)
+    no_deposit: Mapped[bool] = mapped_column(Boolean, default=False)
 
-    # Property condition (NEW)
-    condition: Mapped[Optional[str]] = mapped_column(String(100))  # Состояние/ремонт
-    house_type: Mapped[Optional[str]] = mapped_column(String(100))  # Тип дома (вторичка, новостройка)
+    # Property condition
+    condition: Mapped[Optional[str]] = mapped_column(String(100))
+    house_type: Mapped[Optional[str]] = mapped_column(String(100))
 
     # Amenities (extended)
     has_furniture: Mapped[Optional[bool]] = mapped_column(Boolean)
@@ -160,11 +160,11 @@ class Listing(Base):
     has_internet: Mapped[Optional[bool]] = mapped_column(Boolean)
     has_parking: Mapped[Optional[bool]] = mapped_column(Boolean)
     has_conditioner: Mapped[Optional[bool]] = mapped_column(Boolean)
-    has_washing_machine: Mapped[Optional[bool]] = mapped_column(Boolean)  # NEW
-    has_refrigerator: Mapped[Optional[bool]] = mapped_column(Boolean)  # NEW
-    has_balcony: Mapped[Optional[bool]] = mapped_column(Boolean)  # NEW
+    has_washing_machine: Mapped[Optional[bool]] = mapped_column(Boolean)
+    has_refrigerator: Mapped[Optional[bool]] = mapped_column(Boolean)
+    has_balcony: Mapped[Optional[bool]] = mapped_column(Boolean)
 
-    # Rules (NEW)
+    # Rules
     pets_allowed: Mapped[Optional[bool]] = mapped_column(Boolean)
     kids_allowed: Mapped[Optional[bool]] = mapped_column(Boolean)
 
@@ -174,8 +174,8 @@ class Listing(Base):
     contact_tg: Mapped[Optional[str]] = mapped_column(String(100))
     is_agent: Mapped[Optional[bool]] = mapped_column(Boolean)
 
-    # Description (NEW)
-    description_clean: Mapped[Optional[str]] = mapped_column(Text)  # Чистое описание без технических данных
+    # Description
+    description_clean: Mapped[Optional[str]] = mapped_column(Text)
 
     # Parse quality
     parse_score: Mapped[int] = mapped_column(SmallInteger, default=0)
@@ -253,3 +253,18 @@ class Favorite(Base):
 
     # Relationship
     listing: Mapped["Listing"] = relationship("Listing")
+
+
+class ShareLog(Base):
+    """Лог шаринга объявлений для share-to-unlock"""
+    __tablename__ = "share_logs"
+    __table_args__ = (
+        Index("idx_share_logs_user_listing", "telegram_user_id", "listing_id"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    listing_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("listings.id", ondelete="CASCADE"), nullable=False)
+    share_count: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=func.now(), onupdate=func.now())
