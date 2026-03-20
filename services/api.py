@@ -188,6 +188,62 @@ def local_path_to_url(local_path: str) -> Optional[str]:
 
 
 # ============================================
+# HELPERS: Resolve district/metro IDs to names
+# ============================================
+
+async def resolve_district_names(session, district_ids_str: str) -> List[str]:
+    """
+    Принимает строку ID районов (напр. '7,9'), 
+    возвращает список вариантов для поиска по district_raw.
+    """
+    ids = [int(d.strip()) for d in district_ids_str.split(",") if d.strip().isdigit()]
+    if not ids:
+        return []
+    
+    result = await session.execute(
+        select(District).where(District.id.in_(ids))
+    )
+    districts = list(result.scalars().all())
+    
+    names = []
+    for d in districts:
+        names.append(d.name_ru)
+        if d.name_uz:
+            names.append(d.name_uz)
+        if d.aliases:
+            names.extend(d.aliases)
+        short = d.name_ru.replace(" район", "").strip()
+        names.append(short)
+    
+    return names
+
+
+async def resolve_metro_names(session, metro_ids_str: str) -> List[str]:
+    """
+    Принимает строку ID метро (напр. '8,12'),
+    возвращает список вариантов для поиска по metro_raw.
+    """
+    ids = [int(m.strip()) for m in metro_ids_str.split(",") if m.strip().isdigit()]
+    if not ids:
+        return []
+    
+    result = await session.execute(
+        select(MetroStation).where(MetroStation.id.in_(ids))
+    )
+    stations = list(result.scalars().all())
+    
+    names = []
+    for m in stations:
+        names.append(m.name_ru)
+        if m.name_uz:
+            names.append(m.name_uz)
+        if m.aliases:
+            names.extend(m.aliases)
+    
+    return names
+
+
+# ============================================
 # SHARE-TO-UNLOCK ENDPOINTS
 # ============================================
 
@@ -584,15 +640,24 @@ async def get_listings(
         if currency:
             conditions.append(Listing.currency == currency.lower())
         
+        # FIX: Фильтр по district_raw (текстовый поиск через ILIKE)
+        # Парсер пишет район в district_raw, а district_id часто NULL
         if district:
-            district_ids = [int(d.strip()) for d in district.split(",") if d.strip().isdigit()]
-            if district_ids:
-                conditions.append(Listing.district_id.in_(district_ids))
+            district_names = await resolve_district_names(session, district)
+            if district_names:
+                district_conditions = [
+                    Listing.district_raw.ilike(f"%{name}%") for name in district_names
+                ]
+                conditions.append(or_(*district_conditions))
         
+        # FIX: Фильтр по metro_raw (текстовый поиск через ILIKE)
         if metro:
-            metro_ids = [int(m.strip()) for m in metro.split(",") if m.strip().isdigit()]
-            if metro_ids:
-                conditions.append(Listing.metro_id.in_(metro_ids))
+            metro_names = await resolve_metro_names(session, metro)
+            if metro_names:
+                metro_conditions = [
+                    Listing.metro_raw.ilike(f"%{name}%") for name in metro_names
+                ]
+                conditions.append(or_(*metro_conditions))
         
         if conditions:
             query = query.where(and_(*conditions))
