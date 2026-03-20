@@ -16,7 +16,6 @@ from sqlalchemy import select
 
 from database import get_session
 from database.models import Listing, Post, Media
-from services.share_api import router as share_router
 
 router = APIRouter()
 
