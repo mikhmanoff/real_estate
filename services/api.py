@@ -18,6 +18,7 @@ from decimal import Decimal
 from database import get_session, PostRepo, ListingRepo, MediaRepo
 from sqlalchemy import select, and_, or_, func
 from database.models import Post, Listing, Media, Channel, District, MetroStation, Favorite, ShareLog
+from services.share_api import router as share_router
 
 
 app = FastAPI(title="Rent Finder API")
