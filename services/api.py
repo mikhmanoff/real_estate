@@ -19,6 +19,7 @@ from database import get_session, PostRepo, ListingRepo, MediaRepo
 from sqlalchemy import select, and_, or_, func
 from database.models import Post, Listing, Media, Channel, District, MetroStation, Favorite, ShareLog
 from services.share_api import router as share_router
+from services.analytics_api import router as analytics_router
 
 
 app = FastAPI(title="Rent Finder API")
@@ -35,6 +36,7 @@ app.add_middleware(
 )
 
 app.include_router(share_router)
+app.include_router(analytics_router)
 
 
 # ============================================
