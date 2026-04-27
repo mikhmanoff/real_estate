@@ -22,5 +22,5 @@ pydantic==2.10.2
 httpx==0.28.1
 
 # Optional: image hashing for deduplication
-# imagehash==4.3.1
-# Pillow==11.0.0
+imagehash==4.3.1
+Pillow==11.0.0
