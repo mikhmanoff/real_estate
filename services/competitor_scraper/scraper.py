@@ -10,9 +10,11 @@
    - upsert listing (last_seen_at = now, disappeared_at -> NULL если был помечен)
    - upsert media (главное фото)
    - запись в competitor_snapshots
-   - если фото ещё не скачано — скачать, посчитать phash, сохранить
-4. После полного прохода — помечает disappeared_at для тех, кого не видел в этом run.
-5. Закрывает run (status=done).
+4. Каждые MEDIA_FLUSH_EVERY_PAGES страниц — скачивает накопившиеся медиа.
+   Это даёт инкрементальный прогресс: даже если цикл прервётся на середине,
+   уже скачанное останется в БД.
+5. После полного прохода — финальный flush + помечает disappeared_at.
+6. Закрывает run (status=done).
 """
 import asyncio
 import os
@@ -42,14 +44,14 @@ from .media import (
 )
 
 
-# Если хочется ограничить парсинг только Ташкент-шахри — выставить TASHKENT_ONLY=1
 TASHKENT_ONLY = os.getenv("TASHKENT_ONLY", "0") == "1"
-
-# Максимум страниц за один цикл (предохранитель от runaway)
 MAX_PAGES = int(os.getenv("JOYMI_MAX_PAGES", "20000"))
-
-# Сколько фото скачивать параллельно
 MEDIA_CONCURRENCY = int(os.getenv("JOYMI_MEDIA_CONCURRENCY", "5"))
+
+# NEW: после скольки страниц сбрасывать медиа в скачку.
+# 5 страниц * 50 per_page = 250 фото за флаш. На MEDIA_CONCURRENCY=5
+# и среднем ~2с/фото это ~100с на флаш — нормально.
+MEDIA_FLUSH_EVERY_PAGES = int(os.getenv("JOYMI_MEDIA_FLUSH_EVERY", "5"))
 
 
 def _is_tashkent(item: Dict[str, Any]) -> bool:
@@ -100,7 +102,6 @@ async def upsert_listing(session, item: Dict[str, Any], parsed: Dict[str, Any], 
     """
     listing_id = item["id"]
 
-    # Парсим created_at_remote
     created_at_remote = None
     if item.get("created_at"):
         try:
@@ -145,10 +146,9 @@ async def upsert_listing(session, item: Dict[str, Any], parsed: Dict[str, Any], 
     }
 
     stmt = pg_insert(CompetitorListing).values(**values)
-    # On conflict — update everything except first_seen_at, и ресетим disappeared_at
     update_set = {k: v for k, v in values.items() if k != "id"}
     update_set["last_seen_at"] = func.now()
-    update_set["disappeared_at"] = None  # появился снова — снять метку
+    update_set["disappeared_at"] = None
     stmt = stmt.on_conflict_do_update(
         index_elements=[CompetitorListing.id],
         set_=update_set,
@@ -159,9 +159,6 @@ async def upsert_listing(session, item: Dict[str, Any], parsed: Dict[str, Any], 
     if row is None:
         return False
     first_seen, last_seen = row
-    # NOW() в одной транзакции одинаков для всех вызовов, поэтому
-    # при INSERT first_seen == last_seen. При UPDATE first_seen не трогается,
-    # last_seen обновляется → они разные.
     return first_seen == last_seen
 
 
@@ -214,7 +211,6 @@ async def download_one_media(client, media_id: int) -> Dict[str, Any]:
     Возвращает {ok: bool, error: str|None}.
     """
     async with get_session() as session:
-        # Возьмём актуальное состояние записи
         m = await session.get(CompetitorMedia, media_id)
         if m is None:
             return {"ok": False, "error": "not found"}
@@ -225,7 +221,6 @@ async def download_one_media(client, media_id: int) -> Dict[str, Any]:
         listing_id = m.listing_id
         sort_order = m.sort_order or 0
 
-    # Скачивание — без сессии БД
     data = await client.download_image(url)
     if data is None:
         async with get_session() as session:
@@ -236,7 +231,6 @@ async def download_one_media(client, media_id: int) -> Dict[str, Any]:
             )
         return {"ok": False, "error": "http error"}
 
-    # Сохраняем + считаем pHash + размеры
     try:
         path = save_image(data, listing_id, sort_order, url)
         rel = relative_path(path)
@@ -278,7 +272,12 @@ async def download_media_batch(client, media_ids: List[int]) -> Dict[str, int]:
 
     async def _one(mid):
         async with sem:
-            return await download_one_media(client, mid)
+            try:
+                return await download_one_media(client, mid)
+            except Exception as e:
+                # Защита от того, чтобы одна ошибка не валила весь батч
+                print(f"[media] unexpected error mid={mid}: {e}")
+                return {"ok": False, "error": str(e)}
 
     results = await asyncio.gather(*[_one(m) for m in media_ids], return_exceptions=True)
 
@@ -287,15 +286,39 @@ async def download_media_batch(client, media_ids: List[int]) -> Dict[str, int]:
     return {"ok": ok, "failed": failed}
 
 
+async def flush_pending_media(client, queued_ids: List[int]) -> Dict[str, int]:
+    """
+    Берёт queued_ids, фильтрует только pending/failed, скачивает.
+    Используется и для инкрементального флаша во время обхода, и в финале.
+    """
+    if not queued_ids:
+        return {"ok": 0, "failed": 0}
+
+    # Дедуп — одна и та же запись может попасть в очередь дважды
+    unique_ids = list(set(queued_ids))
+
+    async with get_session() as session:
+        pending_q = await session.execute(
+            select(CompetitorMedia.id).where(
+                and_(
+                    CompetitorMedia.id.in_(unique_ids),
+                    CompetitorMedia.download_status != "ok",
+                )
+            )
+        )
+        pending_ids = [r[0] for r in pending_q.fetchall()]
+
+    if not pending_ids:
+        return {"ok": 0, "failed": 0}
+
+    return await download_media_batch(client, pending_ids)
+
+
 # ============================================
 # MARK DISAPPEARED
 # ============================================
 
 async def mark_disappeared(run_started_at: datetime) -> int:
-    """
-    После полного прохода — listings, чей last_seen_at < run_started_at,
-    больше не появляются на сайте → помечаем disappeared.
-    """
     async with get_session() as session:
         result = await session.execute(
             update(CompetitorListing)
@@ -320,7 +343,6 @@ async def run_one_cycle() -> Dict[str, Any]:
     """Полный цикл: один прогон по всем страницам joymi."""
     cycle_started = datetime.now(timezone.utc)
 
-    # 1. Открываем run
     async with get_session() as session:
         run = CompetitorScrapeRun(status="running")
         session.add(run)
@@ -328,12 +350,29 @@ async def run_one_cycle() -> Dict[str, Any]:
         run_id = run.id
 
     print(f"[scraper] === run {run_id} started at {cycle_started.isoformat()} ===")
+    print(f"[scraper] config: tashkent_only={TASHKENT_ONLY} flush_every={MEDIA_FLUSH_EVERY_PAGES}p concurrency={MEDIA_CONCURRENCY}")
 
     pages_fetched = 0
     listings_seen = 0
     listings_new = 0
-    media_ids_to_download: List[int] = []
+    media_queue: List[int] = []
+    media_stats = {"ok": 0, "failed": 0}
     error_message: Optional[str] = None
+
+    async def _persist_progress():
+        """Обновляет run record с текущим прогрессом — чтобы можно было следить."""
+        async with get_session() as session:
+            await session.execute(
+                update(CompetitorScrapeRun)
+                .where(CompetitorScrapeRun.id == run_id)
+                .values(
+                    pages_fetched=pages_fetched,
+                    listings_seen=listings_seen,
+                    listings_new=listings_new,
+                    media_downloaded=media_stats["ok"],
+                    media_failed=media_stats["failed"],
+                )
+            )
 
     try:
         async with JoymiClient() as client:
@@ -352,11 +391,9 @@ async def run_one_cycle() -> Dict[str, Any]:
 
                 pages_fetched += 1
 
-                # Фильтр Ташкент (если включен)
                 if TASHKENT_ONLY:
                     items = [i for i in items if _is_tashkent(i)]
 
-                # Обрабатываем порциями в одной транзакции
                 async with get_session() as session:
                     for item in items:
                         try:
@@ -368,48 +405,43 @@ async def run_one_cycle() -> Dict[str, Any]:
                             if is_new:
                                 listings_new += 1
 
-                            # Главное фото
                             images = item.get("images") or []
                             if images:
                                 main = next((im for im in images if im.get("is_main")), images[0])
                                 mid = await upsert_main_media(session, item["id"], main)
                                 if mid is not None:
-                                    media_ids_to_download.append(mid)
+                                    media_queue.append(mid)
                         except Exception as e:
                             print(f"[scraper] item {item.get('id')} failed: {e}")
 
-                if pages_fetched % 20 == 0:
-                    print(f"[scraper] page {page}: seen={listings_seen} new={listings_new} media_queued={len(media_ids_to_download)}")
+                # NEW: флашим медиа батчами вместо ожидания конца цикла
+                if pages_fetched % MEDIA_FLUSH_EVERY_PAGES == 0 and media_queue:
+                    print(f"[scraper] page {page}: flushing {len(media_queue)} media items "
+                          f"(seen={listings_seen} new={listings_new})")
+                    flush_stats = await flush_pending_media(client, media_queue)
+                    media_stats["ok"] += flush_stats["ok"]
+                    media_stats["failed"] += flush_stats["failed"]
+                    media_queue.clear()
+                    await _persist_progress()
+                    print(f"[scraper] flush done: ok={flush_stats['ok']} failed={flush_stats['failed']} "
+                          f"| total ok={media_stats['ok']} failed={media_stats['failed']}")
 
                 if not payload.get("has_next"):
                     break
                 page += 1
                 await asyncio.sleep(DEFAULT_DELAY_SEC)
 
-            # 2. Качаем медиа (новые/не скачанные)
-            print(f"[scraper] downloading media: {len(media_ids_to_download)} items...")
-            stats = {"ok": 0, "failed": 0}
-            if media_ids_to_download:
-                # Берём только те, что ещё не скачаны (download_status != 'ok')
-                async with get_session() as session:
-                    pending_q = await session.execute(
-                        select(CompetitorMedia.id).where(
-                            and_(
-                                CompetitorMedia.id.in_(media_ids_to_download),
-                                CompetitorMedia.download_status != "ok",
-                            )
-                        )
-                    )
-                    pending_ids = [r[0] for r in pending_q.fetchall()]
+            # Финальный флаш — то, что не успело попасть в инкрементальный
+            if media_queue:
+                print(f"[scraper] final flush: {len(media_queue)} items")
+                flush_stats = await flush_pending_media(client, media_queue)
+                media_stats["ok"] += flush_stats["ok"]
+                media_stats["failed"] += flush_stats["failed"]
+                media_queue.clear()
 
-                stats = await download_media_batch(client, pending_ids)
-                print(f"[scraper] media: ok={stats['ok']} failed={stats['failed']}")
-
-        # 3. Помечаем пропавшие
         disappeared = await mark_disappeared(cycle_started)
         print(f"[scraper] disappeared: {disappeared}")
 
-        # 4. Закрываем run
         async with get_session() as session:
             await session.execute(
                 update(CompetitorScrapeRun)
@@ -421,8 +453,8 @@ async def run_one_cycle() -> Dict[str, Any]:
                     listings_seen=listings_seen,
                     listings_new=listings_new,
                     listings_disappeared=disappeared,
-                    media_downloaded=stats["ok"],
-                    media_failed=stats["failed"],
+                    media_downloaded=media_stats["ok"],
+                    media_failed=media_stats["failed"],
                     error_message=error_message,
                 )
             )
@@ -433,8 +465,8 @@ async def run_one_cycle() -> Dict[str, Any]:
             "seen": listings_seen,
             "new": listings_new,
             "disappeared": disappeared,
-            "media_ok": stats["ok"],
-            "media_failed": stats["failed"],
+            "media_ok": media_stats["ok"],
+            "media_failed": media_stats["failed"],
         }
         print(f"[scraper] === run {run_id} done: {result}")
         return result
@@ -451,6 +483,8 @@ async def run_one_cycle() -> Dict[str, Any]:
                     pages_fetched=pages_fetched,
                     listings_seen=listings_seen,
                     listings_new=listings_new,
+                    media_downloaded=media_stats["ok"],
+                    media_failed=media_stats["failed"],
                     error_message=str(e)[:1000],
                 )
             )
