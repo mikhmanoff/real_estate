@@ -18,8 +18,11 @@ python-dotenv==1.0.1
 qrcode==8.0
 pydantic==2.10.2
 
-
 httpx==0.28.1
+
+# OLX scraper: HTML parsing
+beautifulsoup4==4.12.3
+lxml==5.2.1
 
 # Optional: image hashing for deduplication
 imagehash==4.3.1
