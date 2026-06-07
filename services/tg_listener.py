@@ -22,8 +22,7 @@ from core.registry import ChannelRegistry
 from core.utils import env, ensure_dirs
 from database import post_service, init_db, close_db
 from services.parser import parse_listing, extract_phones
-
-
+from services.channel_phones import get_channel_fallback_phones  # ← NEW
 
 # ============================================
 # REGEX PATTERNS
@@ -525,7 +524,10 @@ async def run_listener():
 
         post_text = msg.message or ""
         parsed = parse_listing(post_text, tags)
-
+        
+        phones = extract_phones(post_text)
+        if not phones:
+            phones = await get_channel_fallback_phones(client, chat)
         post_data = {
             "post_uid": f"msg:{chat_id}:{int(msg.id)}",
             "message_id": int(msg.id),
@@ -538,7 +540,7 @@ async def run_listener():
             "saved_path": saved_path,
             "media": None,
             "text_len": len(post_text),
-            "phones": extract_phones(post_text),
+            "phones": phones, 
             "links": links,
             "hashtags": tags,
             "mentions": mentions,
@@ -609,7 +611,9 @@ async def run_listener():
 
         first_media_type = media_items[0]["media_type"] if media_items else None
         first_saved_path = media_items[0]["saved_path"] if media_items else None
-
+        phones = extract_phones(post_text)
+        if not phones:
+            phones = await get_channel_fallback_phones(client, chat)
         post_data = {
             "post_uid": f"album:{chat_id}:{int(main_msg.id)}",
             "message_id": int(main_msg.id),
@@ -623,7 +627,7 @@ async def run_listener():
             "saved_path": first_saved_path,
             "media": media_items,
             "text_len": len(post_text),
-            "phones": extract_phones(post_text),
+            "phones": phones, 
             "links": links,
             "hashtags": tags,
             "mentions": mentions,
