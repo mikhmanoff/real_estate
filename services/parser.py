@@ -1,467 +1,713 @@
-# services/competitor_scraper/scraper.py
 """
-Joymi.uz scraper.
+services/parser.py
+==================
+Парсер объявлений недвижимости из Telegram-постов (Ташкент).
 
-CHANGE FROM v1: writes `source='joymi'` and `source_id=str(listing_id)` on every
-upsert. ON CONFLICT key stays as `id` because joymi keeps using its own listing
-id as the surrogate PK (legacy). The new (source, source_id) UNIQUE constraint
-is satisfied by the same write.
+Экспортирует:
+    parse_listing(text, hashtags=None) -> dict   — основная функция парсинга
+    extract_phones(text) -> list[str]            — извлечение номеров телефонов
 
-Everything else identical to v1.
+Импортируется в services/tg_listener.py:
+    from services.parser import parse_listing, extract_phones
 """
-import asyncio
-import os
-from datetime import datetime, timezone
-from decimal import Decimal
-from typing import Any, Dict, List, Optional, Set
+from __future__ import annotations
 
-from sqlalchemy import select, update, and_, func
-from sqlalchemy.dialects.postgresql import insert as pg_insert
+import re
+from typing import Any, Dict, List, Optional, Tuple
 
-from database.connection import get_session
-from database.competitor_models import (
-    CompetitorListing,
-    CompetitorMedia,
-    CompetitorScrapeRun,
-    CompetitorSeller,
-    CompetitorSnapshot,
+
+# ============================================================
+# UZBEK PHONE EXTRACTION
+# ============================================================
+
+# Реальные коды операторов Узбекистана (мобильные + Ташкент-городской).
+# Если появится новый код — добавь сюда, регулярка автоматически его подхватит.
+UZ_OPERATOR_CODES = frozenset({
+    "90", "91", "93", "94", "95", "97", "98", "99",  # мобильные основные
+    "88", "33", "77",                                  # новые мобильные
+    "71", "78",                                        # Ташкент городской
+})
+
+# Кандидаты на телефонные номера. Структура:
+#   [+998 / 998 / 8]?  XX  XXX  XX  XX   (с разделителями или без)
+# Разделители: пробел, тире, точка, скобки.
+_PHONE_CANDIDATE = re.compile(
+    r"(?:\+?\s*9{0,2}\s*8[\s\-\.\(\)]*)?"   # необязательный префикс страны
+    r"\(?\s*(\d{2})\s*\)?"                  # код оператора (2 цифры)
+    r"[\s\-\.\)]*"
+    r"(\d{3})"                              # 3 цифры
+    r"[\s\-\.]*"
+    r"(\d{2})"                              # 2 цифры
+    r"[\s\-\.]*"
+    r"(\d{2})"                              # 2 цифры
 )
 
-from .api_client import JoymiClient, DEFAULT_DELAY_SEC, DEFAULT_PER_PAGE
-from .parser import parse_listing
-from .media import (
-    compute_phash,
-    get_image_dimensions,
-    relative_path,
-    save_image,
+
+def extract_phones(text: str) -> List[str]:
+    """
+    Извлекает узбекские номера телефонов из текста.
+
+    Возвращает отсортированный список нормализованных номеров вида
+    ['+998901234567', '+998712345678'] — без пробелов и разделителей.
+
+    Поддерживает форматы:
+        +998 90 123 45 67
+        +998(90)123-45-67
+        998901234567
+        8 998 90 123 45 67     (с лидирующей 8)
+        90 123 45 67           (без префикса, но с известным кодом оператора)
+
+    Отбрасывает:
+        2026-04-28      (даты)
+        ID:11355        (айдишники)
+        100 000 сум     (цены без structure 2-3-2-2)
+    """
+    if not text:
+        return []
+
+    found: set[str] = set()
+
+    for m in _PHONE_CANDIDATE.finditer(text):
+        # Берём весь матч и достаём только цифры
+        raw = m.group(0)
+        digits = re.sub(r"\D", "", raw)
+
+        # Нормализация: целевой формат — 12 цифр, начинающихся с 998
+        if len(digits) == 13 and digits.startswith("8998"):
+            digits = digits[1:]  # уберём лидирующую 8
+
+        if len(digits) == 12 and digits.startswith("998"):
+            op_code = digits[3:5]
+            if op_code in UZ_OPERATOR_CODES:
+                found.add("+" + digits)
+                continue
+
+        if len(digits) == 9:
+            op_code = digits[:2]
+            if op_code in UZ_OPERATOR_CODES:
+                found.add("+998" + digits)
+
+    return sorted(found)
+
+
+# ============================================================
+# REAL-ESTATE PARSING
+# ============================================================
+
+# Тройная нотация: комнаты/этаж/этажность (например, 2/5/9)
+_TRIPLE_RFE = re.compile(r"\b(\d+)\s*/\s*(\d+)\s*/\s*(\d+)\b")
+
+# Комнаты (несколько вариантов написания, RU + UZ)
+_ROOMS_PATTERNS = [
+    re.compile(r"кол[–\-]?во\s+комнат\s*[:\-–]?\s*(\d+)", re.I),
+    re.compile(r"комнат(?:[ыа])?\s*[:\-–]?\s*(\d+)", re.I),
+    re.compile(r"(\d+)\s*[–\-]?\s*комн", re.I),
+    re.compile(r"(\d+)\s*хонали", re.I),
+    re.compile(r"(\d+)\s*xonali", re.I),
+    re.compile(r"(\d+)\s*xona\b", re.I),
+]
+
+# Этаж
+_FLOOR_PATTERNS = [
+    re.compile(r"этаж\s*[:\-–]?\s*(\d+)\s*(?![\d/])", re.I),
+    re.compile(r"(\d+)\s*[–\-]?\s*этаж(?!н)", re.I),
+    re.compile(r"qavat\s*[:\-–]?\s*(\d+)", re.I),
+]
+
+# Этажность дома
+_TOTAL_FLOORS_PATTERNS = [
+    re.compile(r"этажность\s*[:\-–]?\s*(\d+)", re.I),
+    re.compile(r"этажей\s+в\s+доме\s*[:\-–]?\s*(\d+)", re.I),
+    re.compile(r"(\d+)\s*[–\-]?\s*этажн", re.I),
+]
+
+# Площадь м²
+_AREA_PATTERNS = [
+    re.compile(r"площад[ьия]\s*[:\-–]?\s*(\d+(?:[.,]\d+)?)\s*(?:кв\.?\s*м|м[²2]?)", re.I),
+    re.compile(r"(\d+(?:[.,]\d+)?)\s*(?:кв\.?\s*м|м[²2])", re.I),
+    re.compile(r"площад[ьия][–\-]?\s*(\d+)", re.I),
+]
+
+# Цена + валюта. Возвращаем ВСЕ матчи, чтобы потом приоритизировать USD.
+_PRICE_USD_PATTERNS = [
+    re.compile(r"(\d[\d\s\u00a0]*\d|\d)\s*\$", re.I),
+    re.compile(r"(\d[\d\s\u00a0]*\d|\d)\s*(?:у\.\s*е\.?|у\.е|y\.e\.?|у\.?е\.?|usd|долл)", re.I),
+]
+_PRICE_UZS_PATTERNS = [
+    re.compile(r"(\d[\d\s\u00a0]*\d)\s*(?:сум|so'm|сўм|sum|uzs)", re.I),
+]
+_PRICE_LABEL_PATTERN = re.compile(
+    r"(?:цена|narx)\s*[:\-–]?\s*(\d[\d\s\u00a0]*\d|\d)\s*(\$|у\.?е\.?|y\.?e\.?|долл|сум|sum|so'm|сўм)?",
+    re.I,
 )
 
+# Депозит
+_DEPOSIT_PATTERNS = [
+    re.compile(r"депозит\s*[:\-–]?\s*(\d[\d\s\u00a0]*)", re.I),
+    re.compile(r"залог\s*[:\-–]?\s*(\d[\d\s\u00a0]*)", re.I),
+    re.compile(r"предоплат[аы]?\s*[:\-–]?\s*(\d[\d\s\u00a0]*)", re.I),
+]
+_NO_DEPOSIT_PATTERN = re.compile(r"без\s+(?:депозит|залог|предоплат)", re.I)
 
-TASHKENT_ONLY = os.getenv("TASHKENT_ONLY", "0") == "1"
-MAX_PAGES = int(os.getenv("JOYMI_MAX_PAGES", "20000"))
-MEDIA_CONCURRENCY = int(os.getenv("JOYMI_MEDIA_CONCURRENCY", "5"))
-MEDIA_FLUSH_EVERY_PAGES = int(os.getenv("JOYMI_MEDIA_FLUSH_EVERY", "5"))
+# Район
+_DISTRICT_NAMES = [
+    "Алмазар", "Бектемир", "Мирабад", "Мирзо.?Улугбек", "Сергели",
+    "Шайхантахур", "Юнусабад", "Яккасарай", "Яшнабад", "Чиланзар",
+    "Учтепа", "Янгихаёт",
+]
+_DISTRICT_NAMES_RE = "|".join(_DISTRICT_NAMES)
+_DISTRICT_PATTERNS = [
+    re.compile(r"#?(" + _DISTRICT_NAMES_RE + r")(?:ский|ий|ская)?(?:\s*район)?", re.I),
+    re.compile(r"район\s*[:\-–]?\s*([А-ЯЁа-яё]+?)(?:\s*[,\n◆]|$)", re.I),
+]
+
+# Метро
+_METRO_PATTERNS = [
+    re.compile(r"(?:м\.|метро|metro)\s*[:\-–]?\s*([А-ЯЁа-яёA-Za-z][А-ЯЁа-яёA-Za-z\s]{2,30}?)(?:\s*[,\n◆]|$)", re.I),
+    re.compile(r"#метро[_\s]?([А-ЯЁа-яё]+)", re.I),
+]
+
+# Срок аренды
+_MIN_PERIOD_PATTERN = re.compile(r"(?:мин\.?\s*)?срок\s*[:\-–]?\s*(?:от\s+)?(\d+)\s*мес", re.I)
+
+# Состояние / ремонт
+_CONDITION_PATTERNS = [
+    re.compile(r"состояние\s*[:\-–]?\s*([А-Яа-яЁё\s]+?)(?:\s*[◆\n,]|$)", re.I),
+    re.compile(r"ремонт\s*[:\-–]?\s*([А-Яа-яЁё\s]+?)(?:\s*[◆\n,]|$)", re.I),
+    re.compile(r"(евро\s*ремонт|новый\s*ремонт|косметический|без\s*ремонта)", re.I),
+]
+
+# Тип дома
+_HOUSE_TYPE_PATTERNS = [
+    re.compile(r"тип\s*дома\s*[:\-–]?\s*([А-Яа-яЁё\s]+?)(?:\s*[◆\n,]|$)", re.I),
+    re.compile(r"(вторичн\w*|новостройка|панельн\w*|кирпичн\w*|монолит\w*)", re.I),
+]
+
+# Коммуналка
+_UTILITIES_PATTERN = re.compile(
+    r"коммунал(?:ка|ьные|ьн)\w*\s*[:\-–]?\s*(включен|отдельно|входит|не\s*входит)",
+    re.I,
+)
+
+# Удобства — bilingual keyword lists
+_AMENITY_KEYWORDS = {
+    "furniture":       [r"мебел[ьия]", r"меблирован", r"с\s+мебелью", r"\bmebel\b", r"furnished"],
+    "conditioner":     [r"кондиц", r"\bсплит\b", r"konditsioner", r"air\s*condition"],
+    "washing_machine": [r"стирал", r"стир\.?\s*маш", r"washing\s*mach"],
+    "refrigerator":    [r"холодильник", r"хол-к", r"fridge", r"refrigerator"],
+    "internet":        [r"интернет", r"wi[-\s]?fi", r"internet"],
+    "parking":         [r"парковка", r"паркинг", r"машиноместо", r"parking", r"\bгараж\b"],
+    "balcony":         [r"балкон", r"лоджия", r"\bbalkon\b"],
+    "pets_allowed":    [r"можно\s+с\s+животн", r"животные\s+разрешен", r"pets\s+allowed", r"с\s+питомц"],
+    "kids_allowed":    [r"можно\s+с\s+детьми", r"дети\s+разрешен", r"семь[ея]\s+с\s+детьми"],
+}
+
+# Технические паттерны для очистки описания
+_TECHNICAL_CLEAN_PATTERNS = [
+    r"#\S+",
+    r"[◆◇◈●•▪]\s*",
+    r"тип\s*дома\s*[:\-–]?\s*[^\n◆]+",
+    r"кол[–\-]?во\s+комнат\s*[:\-–]?\s*\d+",
+    r"этаж\s*[:\-–]?\s*\d+",
+    r"этажность\s*[:\-–]?\s*\d+",
+    r"площад[ьия]\s*[:\-–]?\s*[\d.,]+\s*(?:кв\.?\s*м|м[²2]?)?",
+    r"площад[ьия][\-–]?\s*\d+",
+    r"цена\s*[:\-–]?\s*[^\n◆]+",
+    r"narx\s*[:\-–]?\s*[^\n◆]+",
+    r"депозит\s*[:\-–]?\s*[^\n◆]*",
+    r"предоплат[аы]?\s*[:\-–]?\s*[^\n◆]*",
+    r"залог\s*[:\-–]?\s*[^\n◆]*",
+    r"состояние\s*[:\-–]?\s*[^\n◆]+",
+    r"комиссионные\s*[^\n◆]*",
+    r"комиссия\s*[^\n◆]*",
+    r"maklerskiy\s*[^\n◆]*",
+    r"ID\s*[:\-–]?\s*\d+",
+    r"\d+\s*/\s*\d+\s*/\s*\d+",
+    r"(\+?\d[\s\-\(\)]*){7,15}",
+    r"t\.me/\S+",
+    r"@[A-Za-z0-9_]+",
+]
 
 
-def _is_tashkent(item: Dict[str, Any]) -> bool:
-    addr = (item.get("address_line") or "").lower()
-    return "toshkent shahri" in addr or "ташкент" in addr
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _normalize_text(text: str) -> str:
+    if not text:
+        return ""
+    t = text.replace("\u00a0", " ").replace("–", "-").replace("—", "-")
+    t = re.sub(r"\s+", " ", t)
+    return t.strip()
 
 
-def _to_decimal(v) -> Optional[Decimal]:
-    if v is None:
+def _to_int(s: Optional[str]) -> Optional[int]:
+    if not s:
+        return None
+    digits = re.sub(r"\D", "", s)
+    if not digits:
         return None
     try:
-        return Decimal(str(v))
-    except Exception:
+        return int(digits)
+    except ValueError:
         return None
 
 
-# ============================================
-# UPSERTS
-# ============================================
-
-async def upsert_seller(session, raw: Dict[str, Any]) -> Optional[int]:
-    if not raw:
+def _to_float(s: Optional[str]) -> Optional[float]:
+    if not s:
         return None
-    sid = raw.get("id")
-    if sid is None:
+    s = s.replace(",", ".")
+    m = re.search(r"\d+(?:\.\d+)?", s)
+    if not m:
+        return None
+    try:
+        return float(m.group(0))
+    except ValueError:
         return None
 
-    stmt = pg_insert(CompetitorSeller).values(
-        id=sid,
-        uuid=raw.get("uuid"),
-        profile_name=raw.get("profile_name"),
-        avatar_url=raw.get("images") if isinstance(raw.get("images"), str) else None,
-    ).on_conflict_do_update(
-        index_elements=[CompetitorSeller.id],
-        set_={
-            "profile_name": raw.get("profile_name"),
-            "avatar_url": raw.get("images") if isinstance(raw.get("images"), str) else None,
-            "last_seen_at": func.now(),
-        },
-    )
-    await session.execute(stmt)
-    return sid
+
+def _match_first(patterns: List[re.Pattern], text: str) -> Optional[re.Match]:
+    for pat in patterns:
+        m = pat.search(text)
+        if m:
+            return m
+    return None
 
 
-async def upsert_listing(session, item: Dict[str, Any], parsed: Dict[str, Any], seller_id: Optional[int]) -> bool:
-    """Returns True if first time we see this listing (was new)."""
-    listing_id = item["id"]
+def _has_kw(text: str, kws: List[str]) -> bool:
+    for kw in kws:
+        if re.search(kw, text, re.I):
+            return True
+    return False
 
-    created_at_remote = None
-    if item.get("created_at"):
+
+# ============================================================
+# DETECTION
+# ============================================================
+
+_REALTY_KEYWORDS = (
+    "квартир", "комнат", "участок", "недвижим",
+    "аренда", "сдается", "сдаётся", "сдам", "сниму", "снять", "посуточно",
+    "риелтор", "риэлтор", "депозит", "комиссионные",
+    "maklerskiy", "narx", "ijara", "xonali", "kvartira",
+)
+
+_REALTY_TAG_KEYWORDS = ("аренда", "квартира", "дом", "недвиж", "rent", "flat")
+
+
+def _detect_is_real_estate(text: str, hashtags: List[str]) -> bool:
+    t = text.lower()
+    if any(k in t for k in _REALTY_KEYWORDS):
+        return True
+    tags = " ".join(h.lower() for h in (hashtags or []))
+    if any(k in tags for k in _REALTY_TAG_KEYWORDS):
+        return True
+    if re.search(r"\d+\s*\$|\d+\s*у\.?е\.?", t):
+        return True
+    return False
+
+
+def _detect_deal_type(text: str, hashtags: List[str]) -> str:
+    t = text.lower()
+    tags = " ".join(h.lower() for h in (hashtags or []))
+
+    if any(x in t for x in ("сниму", "ищу квартиру", "ищу дом", "ищу комнату", "нужна квартира")):
+        return "wanted_rent"
+    if "куплю" in t:
+        return "wanted_buy"
+    if any(x in t for x in ("посуточно", "сутки", "по суткам", "на сутки", "sutkalik")):
+        return "rent_daily"
+    if any(x in t for x in ("продам", "продаю", "продажа", "на продажу", "sotiladi", "sotilyapti")):
+        return "sale"
+    if any(x in t for x in ("аренда", "сдается", "сдаётся", "сдам", "в аренду", "ijara")):
+        return "rent_long"
+    if "аренда" in tags or "rent" in tags:
+        return "rent_long"
+    if any(x in t for x in ("депозит", "комиссионные", "maklerskiy", "/мес", "в месяц")):
+        return "rent_long"
+    return "rent_long"
+
+
+def _detect_object_type(text: str, hashtags: List[str]) -> str:
+    t = text.lower()
+    tags = " ".join(h.lower() for h in (hashtags or []))
+
+    if "студи" in t:
+        return "studio"
+    if re.search(r"\bкомнат[уа]\b|койко[-\s]место", t) and "квартир" not in t:
+        return "room"
+    if "квартир" in t or "kvartira" in t or "квартира" in tags:
+        return "flat"
+    if re.search(r"\bэтаж\b|qavat", t):
+        return "flat"
+    if any(x in t for x in ("частный дом", "коттедж", "hovli")) or "дом" in tags:
+        return "house"
+    if any(x in t for x in ("участок", "соток", "сотки", "земля", "yer")):
+        return "land"
+    if any(x in t for x in ("офис", "коммерческ", "торговая площадь", "помещение")):
+        return "commercial"
+    return "flat"
+
+
+def _parse_rooms_floor_triple(text: str) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Парсит '2/5/9' → (комнаты, этаж, этажность). С sanity-чеками."""
+    for m in _TRIPLE_RFE.finditer(text):
         try:
-            created_at_remote = datetime.fromisoformat(item["created_at"].replace("Z", "+00:00"))
-        except (ValueError, AttributeError):
-            pass
+            rooms, floor, total = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        except (ValueError, IndexError):
+            continue
+        # Sanity: rooms 1-10, floor ≤ total, total ≤ 60
+        if not (1 <= rooms <= 10):
+            continue
+        if floor > total or total > 60 or floor > 60:
+            continue
+        return rooms, floor, total
+    return None, None, None
 
-    values = {
-        "id": listing_id,
-        # NEW: explicit source identification
-        "source": "joymi",
-        "source_id": str(listing_id),
 
-        "uuid": item.get("uuid"),
-        "slug": item.get("slug"),
-        "title": item.get("title"),
+def _parse_rooms(text: str) -> Optional[int]:
+    m = _match_first(_ROOMS_PATTERNS, text)
+    if m:
+        n = _to_int(m.group(1))
+        if n and 1 <= n <= 10:
+            return n
+    return None
 
-        "price_raw": _to_decimal(item.get("price")),
-        "currency_raw": item.get("currency"),
-        "currency": parsed.get("currency"),
-        "price": _to_decimal(item.get("price")),
-        "deal_type": parsed.get("deal_type"),
 
-        "object_type": parsed.get("object_type"),
-        "rooms": parsed.get("rooms"),
-        "floor": parsed.get("floor"),
-        "total_floors": parsed.get("total_floors"),
-        "area_m2": _to_decimal(parsed.get("area_m2")),
-        "area_sotok": _to_decimal(parsed.get("area_sotok")),
+def _parse_floor(text: str) -> Tuple[Optional[int], Optional[int]]:
+    floor = None
+    total = None
 
-        "address_line": item.get("address_line"),
-        "region": parsed.get("region"),
-        "district_raw": parsed.get("district_raw"),
-        "district_norm": parsed.get("district_norm"),
+    fm = _match_first(_FLOOR_PATTERNS, text)
+    if fm:
+        n = _to_int(fm.group(1))
+        if n and 1 <= n <= 60:
+            floor = n
 
-        "seller_id": seller_id,
+    tm = _match_first(_TOTAL_FLOORS_PATTERNS, text)
+    if tm:
+        n = _to_int(tm.group(1))
+        if n and 1 <= n <= 60:
+            total = n
 
-        "is_vip": item.get("is_vip"),
-        "is_top": item.get("is_top"),
-        "is_raised": item.get("is_raised"),
-        "status": item.get("status"),
+    return floor, total
 
-        "created_at_remote": created_at_remote,
-        "parse_score": parsed.get("parse_score"),
-        "needs_review": parsed.get("needs_review"),
+
+def _parse_area(text: str) -> Optional[float]:
+    m = _match_first(_AREA_PATTERNS, text)
+    if m:
+        v = _to_float(m.group(1))
+        if v and 5 <= v <= 5000:
+            return v
+    return None
+
+
+def _parse_price(text: str, deal_type: str) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """
+    Возвращает (price, currency, period).
+    
+    При двойной валюте (например '7 300 000 сум (600 у.е.)') ПРИОРИТЕТ USD —
+    долларовая цена надёжнее, в сумах часто прыгают цифры на курсе.
+    """
+    # Сначала ищем все USD-цены
+    usd_prices: List[int] = []
+    for pat in _PRICE_USD_PATTERNS:
+        for m in pat.finditer(text):
+            v = _to_int(m.group(1))
+            if v and 50 <= v <= 5_000_000:  # разумный диапазон
+                usd_prices.append(v)
+
+    # Потом UZS
+    uzs_prices: List[int] = []
+    for pat in _PRICE_UZS_PATTERNS:
+        for m in pat.finditer(text):
+            v = _to_int(m.group(1))
+            if v and 10_000 <= v <= 100_000_000_000:
+                uzs_prices.append(v)
+
+    # И на всякий — паттерн с явной меткой "Цена:"
+    label_m = _PRICE_LABEL_PATTERN.search(text)
+    if label_m and not usd_prices and not uzs_prices:
+        v = _to_int(label_m.group(1))
+        cur = (label_m.group(2) or "").lower()
+        if v:
+            if any(x in cur for x in ("сум", "sum", "so'm", "сўм", "uzs")):
+                uzs_prices.append(v)
+            else:
+                usd_prices.append(v)
+
+    # Приоритет USD
+    if usd_prices:
+        price, currency = min(usd_prices) if len(usd_prices) > 1 else usd_prices[0], "usd"
+        # Если разброс — берём самый частый. Но для простоты берём первый.
+        price = usd_prices[0]
+    elif uzs_prices:
+        price, currency = uzs_prices[0], "uzs"
+    else:
+        return None, None, None
+
+    # Период
+    tl = text.lower()
+    if any(x in tl for x in ("в месяц", "/мес", "ежемесячно", "oyiga")):
+        period = "month"
+    elif any(x in tl for x in ("в сутки", "посуточно", "/сут", "sutkasiga")):
+        period = "day"
+    elif deal_type == "sale":
+        period = "total"
+    else:
+        period = "month"
+
+    return price, currency, period
+
+
+def _parse_deposit(text: str) -> Tuple[Optional[int], bool]:
+    if _NO_DEPOSIT_PATTERN.search(text):
+        return None, True
+    for pat in _DEPOSIT_PATTERNS:
+        m = pat.search(text)
+        if m and m.group(1):
+            v = _to_int(m.group(1))
+            if v:
+                return v, False
+    return None, False
+
+
+def _parse_district(text: str) -> Optional[str]:
+    m = _match_first(_DISTRICT_PATTERNS, text)
+    if m:
+        d = m.group(1).strip()
+        d = re.sub(r"[#_]", " ", d).strip()
+        return d
+    return None
+
+
+def _parse_metro(text: str) -> Optional[str]:
+    m = _match_first(_METRO_PATTERNS, text)
+    if m:
+        s = m.group(1).strip()
+        s = re.sub(r"[#_]", " ", s).strip()
+        s = re.sub(r"\s+(рядом|около|близко)$", "", s, flags=re.I)
+        if 2 < len(s) < 50:
+            return s
+    return None
+
+
+def _parse_min_period(text: str) -> Optional[int]:
+    m = _MIN_PERIOD_PATTERN.search(text)
+    if m:
+        return _to_int(m.group(1))
+    return None
+
+
+def _parse_utilities_included(text: str) -> Optional[bool]:
+    m = _UTILITIES_PATTERN.search(text)
+    if m:
+        v = m.group(1).lower()
+        if any(x in v for x in ("включен", "входит")):
+            return True
+        if any(x in v for x in ("отдельно", "не входит", "не включен")):
+            return False
+    return None
+
+
+def _parse_condition(text: str) -> Optional[str]:
+    m = _match_first(_CONDITION_PATTERNS, text)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _parse_house_type(text: str) -> Optional[str]:
+    m = _match_first(_HOUSE_TYPE_PATTERNS, text)
+    if m:
+        return m.group(1).strip()
+    return None
+
+
+def _parse_amenities(text: str) -> Dict[str, bool]:
+    return {key: _has_kw(text, kws) for key, kws in _AMENITY_KEYWORDS.items()}
+
+
+def _clean_description(text: str) -> str:
+    """Убирает технические данные, оставляет человекочитаемое описание."""
+    if not text:
+        return ""
+
+    result = text
+    for pat in _TECHNICAL_CLEAN_PATTERNS:
+        result = re.sub(pat, " ", result, flags=re.I)
+
+    lines = []
+    for line in result.split("\n"):
+        line = line.strip()
+        if not line or len(line) < 15:
+            continue
+        if re.match(r"^[\d\s\-+\(\)\.,:;/\\◆◇●•▪]+$", line):
+            continue
+        lines.append(line)
+
+    result = "\n".join(lines)
+    result = re.sub(r"[ \t]+", " ", result)
+    result = re.sub(r"\n\s*\n+", "\n", result)
+    result = result.strip()
+
+    return result if len(result) >= 20 else ""
+
+
+# ============================================================
+# MAIN ENTRY POINT
+# ============================================================
+
+def parse_listing(text: str, hashtags: List[str] = None) -> Dict[str, Any]:
+    """
+    Главная функция: парсит Telegram-пост и возвращает структурированные данные.
+
+    Args:
+        text: сырой текст поста
+        hashtags: список хештегов (опционально)
+
+    Returns:
+        dict с ключами is_real_estate, deal_type, object_type, rooms, floor, ...
+        Если пост не про недвижимость — возвращает {"is_real_estate": False}.
+    """
+    text = text or ""
+    hashtags = hashtags or []
+
+    text_norm = _normalize_text(text)
+    if not text_norm:
+        return {"is_real_estate": False}
+
+    if not _detect_is_real_estate(text_norm, hashtags):
+        return {"is_real_estate": False}
+
+    deal_type = _detect_deal_type(text_norm, hashtags)
+    object_type = _detect_object_type(text_norm, hashtags)
+
+    # Сначала пробуем тройной формат 2/5/9
+    rooms, floor, total_floors = _parse_rooms_floor_triple(text_norm)
+    # Если не нашли — парсим поля по отдельности
+    if rooms is None:
+        rooms = _parse_rooms(text_norm)
+    if floor is None or total_floors is None:
+        f, tf = _parse_floor(text_norm)
+        floor = floor or f
+        total_floors = total_floors or tf
+
+    area = _parse_area(text_norm)
+    price, currency, price_period = _parse_price(text_norm, deal_type)
+    deposit, no_deposit = _parse_deposit(text_norm)
+
+    district = _parse_district(text_norm)
+    metro = _parse_metro(text_norm)
+
+    min_period = _parse_min_period(text_norm)
+    utilities_included = _parse_utilities_included(text_norm)
+
+    condition = _parse_condition(text_norm)
+    house_type = _parse_house_type(text_norm)
+
+    amenities = _parse_amenities(text_norm)
+    phones = extract_phones(text)
+    description_clean = _clean_description(text)
+
+    has_commission = any(x in text_norm.lower() for x in (
+        "комиссионные", "комиссия", "maklerskiy", "риелтор", "риэлтор", "агент"
+    ))
+
+    return {
+        "is_real_estate": True,
+
+        "deal_type": deal_type,
+        "object_type": object_type,
+
+        "rooms": rooms,
+        "floor": floor,
+        "total_floors": total_floors,
+        "area_m2": area,
+
+        "price": price,
+        "currency": currency,
+        "price_period": price_period,
+
+        "deposit": deposit,
+        "no_deposit": no_deposit,
+
+        "district_raw": district,
+        "metro_raw": metro,
+        "landmark": None,
+
+        "min_period_months": min_period,
+        "utilities_included": utilities_included,
+        "has_commission": has_commission,
+
+        "condition": condition,
+        "house_type": house_type,
+
+        "has_furniture":       amenities.get("furniture", False),
+        "has_conditioner":     amenities.get("conditioner", False),
+        "has_washing_machine": amenities.get("washing_machine", False),
+        "has_refrigerator":    amenities.get("refrigerator", False),
+        "has_internet":        amenities.get("internet", False),
+        "has_parking":         amenities.get("parking", False),
+        "has_balcony":         amenities.get("balcony", False),
+        "pets_allowed":        amenities.get("pets_allowed", False),
+        "kids_allowed":        amenities.get("kids_allowed", False),
+
+        "phones": phones,
+        "description_clean": description_clean,
     }
 
-    stmt = pg_insert(CompetitorListing).values(**values)
-    update_set = {k: v for k, v in values.items() if k not in ("id", "source", "source_id")}
-    update_set["last_seen_at"] = func.now()
-    update_set["disappeared_at"] = None
-    stmt = stmt.on_conflict_do_update(
-        index_elements=[CompetitorListing.id],
-        set_=update_set,
-    ).returning(CompetitorListing.first_seen_at, CompetitorListing.last_seen_at)
 
-    result = await session.execute(stmt)
-    row = result.fetchone()
-    if row is None:
-        return False
-    first_seen, last_seen = row
-    return first_seen == last_seen
+# ============================================================
+# SELF-TEST
+# ============================================================
 
+if __name__ == "__main__":
+    # Тесты на extract_phones
+    phone_tests = [
+        ("+998 90 123 45 67",          ["+998901234567"]),
+        ("+998(90)123-45-67",          ["+998901234567"]),
+        ("998901234567",               ["+998901234567"]),
+        ("8 998 90 123 45 67",         ["+998901234567"]),
+        ("Звоните: 90 123 45 67",      ["+998901234567"]),
+        ("Тел: 901234567",             ["+998901234567"]),
+        ("Тел.: 71 123-45-67",         ["+998711234567"]),
+        ("2026-04-28 опубликовано",    []),
+        ("ID:11355",                   []),
+        ("100 000 сум депозит",        []),
+        ("два номера: +998901112233 и 935554455", ["+998901112233", "+998935554455"]),
+    ]
 
-async def upsert_main_media(session, listing_id: int, image: Dict[str, Any]) -> Optional[int]:
-    if not image or not image.get("url"):
-        return None
+    print("=== Тесты extract_phones ===")
+    ok_count = 0
+    for text, expected in phone_tests:
+        result = extract_phones(text)
+        status = "✓" if result == expected else "✗"
+        if result == expected:
+            ok_count += 1
+        print(f"  {status} {text!r:50s} → {result}")
+        if result != expected:
+            print(f"      ожидалось: {expected}")
+    print(f"  {ok_count}/{len(phone_tests)} прошло")
 
-    values = {
-        "listing_id": listing_id,
-        "remote_id": image.get("id"),
-        "file_id": image.get("file_id"),
-        "remote_url": image["url"],
-        "is_main": bool(image.get("is_main")),
-        "sort_order": int(image.get("order") or 0),
-    }
-    stmt = pg_insert(CompetitorMedia).values(**values).on_conflict_do_update(
-        index_elements=[CompetitorMedia.listing_id, CompetitorMedia.remote_url],
-        set_={
-            "is_main": values["is_main"],
-            "sort_order": values["sort_order"],
-            "remote_id": values["remote_id"],
-            "file_id": values["file_id"],
-        },
-    ).returning(CompetitorMedia.id, CompetitorMedia.download_status)
-    result = await session.execute(stmt)
-    row = result.fetchone()
-    return row[0] if row else None
+    # Тест на полный парсинг
+    sample = """#Мирабадский район, Метро Ойбек, Ор-р Точка вкуса
+◆ Тип дома: Вторичный фонд
+◆ Кол-во комнат: 1
+◆ 2/3/5
+◆ Площадь: 35 м²
+◆ Цена: 650$/мес
+◆ Депозит: 1300$
+◆ Состояние: Евро ремонт
 
+Светлая уютная квартира в центре города. Рядом метро, магазины, кафе.
+Полностью меблирована, есть кондиционер и стиральная машина.
 
-async def record_snapshot(session, run_id: int, listing_id: int, page_index: int, item: Dict[str, Any]) -> None:
-    stmt = pg_insert(CompetitorSnapshot).values(
-        run_id=run_id,
-        listing_id=listing_id,
-        page_index=page_index,
-        is_vip=item.get("is_vip"),
-        is_top=item.get("is_top"),
-        is_raised=item.get("is_raised"),
-    ).on_conflict_do_nothing(index_elements=[CompetitorSnapshot.run_id, CompetitorSnapshot.listing_id])
-    await session.execute(stmt)
++998 90 123 45 67
+@landlord_tashkent"""
 
-
-# ============================================
-# MEDIA DOWNLOAD (unchanged from v1)
-# ============================================
-
-async def download_one_media(client, media_id: int) -> Dict[str, Any]:
-    async with get_session() as session:
-        m = await session.get(CompetitorMedia, media_id)
-        if m is None:
-            return {"ok": False, "error": "not found"}
-        if m.download_status == "ok" and m.local_path:
-            return {"ok": True, "error": None, "skipped": True}
-
-        url = m.remote_url
-        listing_id = m.listing_id
-        sort_order = m.sort_order or 0
-
-    data = await client.download_image(url)
-    if data is None:
-        async with get_session() as session:
-            await session.execute(
-                update(CompetitorMedia)
-                .where(CompetitorMedia.id == media_id)
-                .values(download_status="failed", download_error="http error")
-            )
-        return {"ok": False, "error": "http error"}
-
-    try:
-        path = save_image(data, listing_id, sort_order, url)
-        rel = relative_path(path)
-        phash = compute_phash(data)
-        w, h = get_image_dimensions(data)
-        size = len(data)
-    except Exception as e:
-        async with get_session() as session:
-            await session.execute(
-                update(CompetitorMedia)
-                .where(CompetitorMedia.id == media_id)
-                .values(download_status="failed", download_error=str(e)[:500])
-            )
-        return {"ok": False, "error": str(e)}
-
-    async with get_session() as session:
-        await session.execute(
-            update(CompetitorMedia)
-            .where(CompetitorMedia.id == media_id)
-            .values(
-                local_path=rel,
-                phash=phash,
-                width=w,
-                height=h,
-                file_size=size,
-                download_status="ok",
-                download_error=None,
-            )
-        )
-    return {"ok": True, "error": None}
-
-
-async def download_media_batch(client, media_ids: List[int]) -> Dict[str, int]:
-    if not media_ids:
-        return {"ok": 0, "failed": 0}
-
-    sem = asyncio.Semaphore(MEDIA_CONCURRENCY)
-
-    async def _one(mid):
-        async with sem:
-            try:
-                return await download_one_media(client, mid)
-            except Exception as e:
-                print(f"[media] unexpected error mid={mid}: {e}")
-                return {"ok": False, "error": str(e)}
-
-    results = await asyncio.gather(*[_one(m) for m in media_ids], return_exceptions=True)
-
-    ok = sum(1 for r in results if isinstance(r, dict) and r.get("ok"))
-    failed = len(results) - ok
-    return {"ok": ok, "failed": failed}
-
-
-async def flush_pending_media(client, queued_ids: List[int]) -> Dict[str, int]:
-    if not queued_ids:
-        return {"ok": 0, "failed": 0}
-
-    unique_ids = list(set(queued_ids))
-
-    async with get_session() as session:
-        pending_q = await session.execute(
-            select(CompetitorMedia.id).where(
-                and_(
-                    CompetitorMedia.id.in_(unique_ids),
-                    CompetitorMedia.download_status != "ok",
-                )
-            )
-        )
-        pending_ids = [r[0] for r in pending_q.fetchall()]
-
-    if not pending_ids:
-        return {"ok": 0, "failed": 0}
-
-    return await download_media_batch(client, pending_ids)
-
-
-async def mark_disappeared(run_started_at: datetime) -> int:
-    """
-    Only mark joymi listings as disappeared. We scope by source so OLX runs
-    don't accidentally mark joymi rows as gone (and vice-versa).
-    """
-    async with get_session() as session:
-        result = await session.execute(
-            update(CompetitorListing)
-            .where(
-                and_(
-                    CompetitorListing.source == "joymi",
-                    CompetitorListing.last_seen_at < run_started_at,
-                    CompetitorListing.disappeared_at.is_(None),
-                )
-            )
-            .values(disappeared_at=func.now())
-            .returning(CompetitorListing.id)
-        )
-        rows = result.fetchall()
-        return len(rows)
-
-
-# ============================================
-# MAIN CYCLE
-# ============================================
-
-async def run_one_cycle() -> Dict[str, Any]:
-    cycle_started = datetime.now(timezone.utc)
-
-    async with get_session() as session:
-        run = CompetitorScrapeRun(source="joymi", status="running")
-        session.add(run)
-        await session.flush()
-        run_id = run.id
-
-    print(f"[scraper] === run {run_id} started at {cycle_started.isoformat()} ===")
-    print(f"[scraper] config: tashkent_only={TASHKENT_ONLY} flush_every={MEDIA_FLUSH_EVERY_PAGES}p concurrency={MEDIA_CONCURRENCY}")
-
-    pages_fetched = 0
-    listings_seen = 0
-    listings_new = 0
-    media_queue: List[int] = []
-    media_stats = {"ok": 0, "failed": 0}
-    error_message: Optional[str] = None
-
-    async def _persist_progress():
-        async with get_session() as session:
-            await session.execute(
-                update(CompetitorScrapeRun)
-                .where(CompetitorScrapeRun.id == run_id)
-                .values(
-                    pages_fetched=pages_fetched,
-                    listings_seen=listings_seen,
-                    listings_new=listings_new,
-                    media_downloaded=media_stats["ok"],
-                    media_failed=media_stats["failed"],
-                )
-            )
-
-    try:
-        async with JoymiClient() as client:
-            page = 1
-            while page <= MAX_PAGES:
-                try:
-                    payload = await client.get_page(page)
-                except Exception as e:
-                    print(f"[scraper] failed page {page}: {e}; aborting cycle")
-                    error_message = f"page {page}: {e}"
-                    break
-
-                items = payload.get("results") or []
-                if not items:
-                    break
-
-                pages_fetched += 1
-
-                if TASHKENT_ONLY:
-                    items = [i for i in items if _is_tashkent(i)]
-
-                async with get_session() as session:
-                    for item in items:
-                        try:
-                            parsed = parse_listing(item)
-                            seller_id = await upsert_seller(session, item.get("seller") or {})
-                            is_new = await upsert_listing(session, item, parsed, seller_id)
-                            await record_snapshot(session, run_id, item["id"], page, item)
-                            listings_seen += 1
-                            if is_new:
-                                listings_new += 1
-
-                            images = item.get("images") or []
-                            if images:
-                                main = next((im for im in images if im.get("is_main")), images[0])
-                                mid = await upsert_main_media(session, item["id"], main)
-                                if mid is not None:
-                                    media_queue.append(mid)
-                        except Exception as e:
-                            print(f"[scraper] item {item.get('id')} failed: {e}")
-
-                if pages_fetched % MEDIA_FLUSH_EVERY_PAGES == 0 and media_queue:
-                    print(f"[scraper] page {page}: flushing {len(media_queue)} media items "
-                          f"(seen={listings_seen} new={listings_new})")
-                    flush_stats = await flush_pending_media(client, media_queue)
-                    media_stats["ok"] += flush_stats["ok"]
-                    media_stats["failed"] += flush_stats["failed"]
-                    media_queue.clear()
-                    await _persist_progress()
-                    print(f"[scraper] flush done: ok={flush_stats['ok']} failed={flush_stats['failed']} "
-                          f"| total ok={media_stats['ok']} failed={media_stats['failed']}")
-
-                if not payload.get("has_next"):
-                    break
-                page += 1
-                await asyncio.sleep(DEFAULT_DELAY_SEC)
-
-            if media_queue:
-                print(f"[scraper] final flush: {len(media_queue)} items")
-                flush_stats = await flush_pending_media(client, media_queue)
-                media_stats["ok"] += flush_stats["ok"]
-                media_stats["failed"] += flush_stats["failed"]
-                media_queue.clear()
-
-        disappeared = await mark_disappeared(cycle_started)
-        print(f"[scraper] disappeared: {disappeared}")
-
-        async with get_session() as session:
-            await session.execute(
-                update(CompetitorScrapeRun)
-                .where(CompetitorScrapeRun.id == run_id)
-                .values(
-                    finished_at=func.now(),
-                    status="done" if not error_message else "interrupted",
-                    pages_fetched=pages_fetched,
-                    listings_seen=listings_seen,
-                    listings_new=listings_new,
-                    listings_disappeared=disappeared,
-                    media_downloaded=media_stats["ok"],
-                    media_failed=media_stats["failed"],
-                    error_message=error_message,
-                )
-            )
-
-        result = {
-            "run_id": run_id,
-            "pages": pages_fetched,
-            "seen": listings_seen,
-            "new": listings_new,
-            "disappeared": disappeared,
-            "media_ok": media_stats["ok"],
-            "media_failed": media_stats["failed"],
-        }
-        print(f"[scraper] === run {run_id} done: {result}")
-        return result
-
-    except Exception as e:
-        print(f"[scraper] cycle FAILED: {e}")
-        async with get_session() as session:
-            await session.execute(
-                update(CompetitorScrapeRun)
-                .where(CompetitorScrapeRun.id == run_id)
-                .values(
-                    finished_at=func.now(),
-                    status="failed",
-                    pages_fetched=pages_fetched,
-                    listings_seen=listings_seen,
-                    listings_new=listings_new,
-                    media_downloaded=media_stats["ok"],
-                    media_failed=media_stats["failed"],
-                    error_message=str(e)[:1000],
-                )
-            )
-        raise
+    print("\n=== Тест parse_listing ===")
+    result = parse_listing(sample, ["#аренда", "#квартира", "#мирабад"])
+    for key, value in result.items():
+        if value is not None and value is not False and value != "":
+            print(f"  {key}: {value}")
