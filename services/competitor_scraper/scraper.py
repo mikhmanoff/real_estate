@@ -1,28 +1,22 @@
 # services/competitor_scraper/scraper.py
 """
-Основная логика сбора. Один цикл = полный обход всех страниц.
+Joymi.uz scraper.
 
-Что делает один цикл (run):
-1. Создаёт запись в competitor_scrape_runs (status=running).
-2. Идёт по страницам list-combined постранично.
-3. Для каждого item:
-   - upsert seller
-   - upsert listing (last_seen_at = now, disappeared_at -> NULL если был помечен)
-   - upsert media (главное фото)
-   - запись в competitor_snapshots
-4. Каждые MEDIA_FLUSH_EVERY_PAGES страниц — скачивает накопившиеся медиа.
-   Это даёт инкрементальный прогресс: даже если цикл прервётся на середине,
-   уже скачанное останется в БД.
-5. После полного прохода — финальный flush + помечает disappeared_at.
-6. Закрывает run (status=done).
+Fixes vs предыдущей версии (v2-aware):
+1. upsert_listing(): передаём source='joymi' и source_id=str(listing_id).
+   Без этого INSERT падает на NOT-NULL констрейнте после v2-миграции.
+2. CompetitorScrapeRun создаётся с source='joymi'.
+3. mark_disappeared() скопирован по source='joymi' — не трогает OLX-строки.
+
+Логика обхода, флаша медиа и пр. — без изменений.
 """
 import asyncio
 import os
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional
 
-from sqlalchemy import select, update, and_, func
+from sqlalchemy import and_, func, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from database.connection import get_session
@@ -47,10 +41,6 @@ from .media import (
 TASHKENT_ONLY = os.getenv("TASHKENT_ONLY", "0") == "1"
 MAX_PAGES = int(os.getenv("JOYMI_MAX_PAGES", "20000"))
 MEDIA_CONCURRENCY = int(os.getenv("JOYMI_MEDIA_CONCURRENCY", "5"))
-
-# NEW: после скольки страниц сбрасывать медиа в скачку.
-# 5 страниц * 50 per_page = 250 фото за флаш. На MEDIA_CONCURRENCY=5
-# и среднем ~2с/фото это ~100с на флаш — нормально.
 MEDIA_FLUSH_EVERY_PAGES = int(os.getenv("JOYMI_MEDIA_FLUSH_EVERY", "5"))
 
 
@@ -68,9 +58,9 @@ def _to_decimal(v) -> Optional[Decimal]:
         return None
 
 
-# ============================================
+# ============================================================
 # UPSERTS
-# ============================================
+# ============================================================
 
 async def upsert_seller(session, raw: Dict[str, Any]) -> Optional[int]:
     if not raw:
@@ -96,9 +86,18 @@ async def upsert_seller(session, raw: Dict[str, Any]) -> Optional[int]:
     return sid
 
 
-async def upsert_listing(session, item: Dict[str, Any], parsed: Dict[str, Any], seller_id: Optional[int]) -> bool:
+async def upsert_listing(
+    session,
+    item: Dict[str, Any],
+    parsed: Dict[str, Any],
+    seller_id: Optional[int],
+) -> bool:
     """
-    Returns True if this is the first time we see this listing (was new).
+    Returns True if this is the first time we see this listing.
+
+    Передаём ОБЯЗАТЕЛЬНЫЕ source/source_id — после v2-миграции NOT NULL.
+    На conflict (id) обновляем все поля КРОМЕ identity (id, source, source_id) —
+    эти три никогда не меняются для одного и того же листинга.
     """
     listing_id = item["id"]
 
@@ -111,6 +110,10 @@ async def upsert_listing(session, item: Dict[str, Any], parsed: Dict[str, Any], 
 
     values = {
         "id": listing_id,
+        # === NEW: явная source identification (требование v2-миграции) ===
+        "source": "joymi",
+        "source_id": str(listing_id),
+        # ==================================================================
         "uuid": item.get("uuid"),
         "slug": item.get("slug"),
         "title": item.get("title"),
@@ -146,9 +149,14 @@ async def upsert_listing(session, item: Dict[str, Any], parsed: Dict[str, Any], 
     }
 
     stmt = pg_insert(CompetitorListing).values(**values)
-    update_set = {k: v for k, v in values.items() if k != "id"}
+    # Identity columns (id, source, source_id) НЕ перезаписываем при on conflict
+    update_set = {
+        k: v for k, v in values.items()
+        if k not in ("id", "source", "source_id")
+    }
     update_set["last_seen_at"] = func.now()
     update_set["disappeared_at"] = None
+
     stmt = stmt.on_conflict_do_update(
         index_elements=[CompetitorListing.id],
         set_=update_set,
@@ -163,7 +171,6 @@ async def upsert_listing(session, item: Dict[str, Any], parsed: Dict[str, Any], 
 
 
 async def upsert_main_media(session, listing_id: int, image: Dict[str, Any]) -> Optional[int]:
-    """Upsert по (listing_id, remote_url). Возвращает id записи media."""
     if not image or not image.get("url"):
         return None
 
@@ -189,7 +196,13 @@ async def upsert_main_media(session, listing_id: int, image: Dict[str, Any]) -> 
     return row[0] if row else None
 
 
-async def record_snapshot(session, run_id: int, listing_id: int, page_index: int, item: Dict[str, Any]) -> None:
+async def record_snapshot(
+    session,
+    run_id: int,
+    listing_id: int,
+    page_index: int,
+    item: Dict[str, Any],
+) -> None:
     stmt = pg_insert(CompetitorSnapshot).values(
         run_id=run_id,
         listing_id=listing_id,
@@ -197,19 +210,17 @@ async def record_snapshot(session, run_id: int, listing_id: int, page_index: int
         is_vip=item.get("is_vip"),
         is_top=item.get("is_top"),
         is_raised=item.get("is_raised"),
-    ).on_conflict_do_nothing(index_elements=[CompetitorSnapshot.run_id, CompetitorSnapshot.listing_id])
+    ).on_conflict_do_nothing(
+        index_elements=[CompetitorSnapshot.run_id, CompetitorSnapshot.listing_id]
+    )
     await session.execute(stmt)
 
 
-# ============================================
+# ============================================================
 # MEDIA DOWNLOAD
-# ============================================
+# ============================================================
 
 async def download_one_media(client, media_id: int) -> Dict[str, Any]:
-    """
-    Скачивает фото для одной записи media (если ещё не скачано).
-    Возвращает {ok: bool, error: str|None}.
-    """
     async with get_session() as session:
         m = await session.get(CompetitorMedia, media_id)
         if m is None:
@@ -264,7 +275,6 @@ async def download_one_media(client, media_id: int) -> Dict[str, Any]:
 
 
 async def download_media_batch(client, media_ids: List[int]) -> Dict[str, int]:
-    """Качает много фото параллельно с лимитом."""
     if not media_ids:
         return {"ok": 0, "failed": 0}
 
@@ -275,26 +285,19 @@ async def download_media_batch(client, media_ids: List[int]) -> Dict[str, int]:
             try:
                 return await download_one_media(client, mid)
             except Exception as e:
-                # Защита от того, чтобы одна ошибка не валила весь батч
                 print(f"[media] unexpected error mid={mid}: {e}")
                 return {"ok": False, "error": str(e)}
 
     results = await asyncio.gather(*[_one(m) for m in media_ids], return_exceptions=True)
-
     ok = sum(1 for r in results if isinstance(r, dict) and r.get("ok"))
     failed = len(results) - ok
     return {"ok": ok, "failed": failed}
 
 
 async def flush_pending_media(client, queued_ids: List[int]) -> Dict[str, int]:
-    """
-    Берёт queued_ids, фильтрует только pending/failed, скачивает.
-    Используется и для инкрементального флаша во время обхода, и в финале.
-    """
     if not queued_ids:
         return {"ok": 0, "failed": 0}
 
-    # Дедуп — одна и та же запись может попасть в очередь дважды
     unique_ids = list(set(queued_ids))
 
     async with get_session() as session:
@@ -314,16 +317,21 @@ async def flush_pending_media(client, queued_ids: List[int]) -> Dict[str, int]:
     return await download_media_batch(client, pending_ids)
 
 
-# ============================================
-# MARK DISAPPEARED
-# ============================================
+# ============================================================
+# MARK DISAPPEARED — scoped by source='joymi'
+# ============================================================
 
 async def mark_disappeared(run_started_at: datetime) -> int:
+    """
+    Помечаем как disappeared ТОЛЬКО joymi-строки.
+    Без фильтра по source мы бы затёрли OLX-строки, которые не обновлялись в этом прогоне.
+    """
     async with get_session() as session:
         result = await session.execute(
             update(CompetitorListing)
             .where(
                 and_(
+                    CompetitorListing.source == "joymi",
                     CompetitorListing.last_seen_at < run_started_at,
                     CompetitorListing.disappeared_at.is_(None),
                 )
@@ -331,26 +339,28 @@ async def mark_disappeared(run_started_at: datetime) -> int:
             .values(disappeared_at=func.now())
             .returning(CompetitorListing.id)
         )
-        rows = result.fetchall()
-        return len(rows)
+        return len(result.fetchall())
 
 
-# ============================================
+# ============================================================
 # MAIN CYCLE
-# ============================================
+# ============================================================
 
 async def run_one_cycle() -> Dict[str, Any]:
-    """Полный цикл: один прогон по всем страницам joymi."""
     cycle_started = datetime.now(timezone.utc)
 
     async with get_session() as session:
-        run = CompetitorScrapeRun(status="running")
+        # source='joymi' нужен для фильтрации логов и аналитики прогонов
+        run = CompetitorScrapeRun(source="joymi", status="running")
         session.add(run)
         await session.flush()
         run_id = run.id
 
     print(f"[scraper] === run {run_id} started at {cycle_started.isoformat()} ===")
-    print(f"[scraper] config: tashkent_only={TASHKENT_ONLY} flush_every={MEDIA_FLUSH_EVERY_PAGES}p concurrency={MEDIA_CONCURRENCY}")
+    print(
+        f"[scraper] config: tashkent_only={TASHKENT_ONLY} "
+        f"flush_every={MEDIA_FLUSH_EVERY_PAGES}p concurrency={MEDIA_CONCURRENCY}"
+    )
 
     pages_fetched = 0
     listings_seen = 0
@@ -360,7 +370,6 @@ async def run_one_cycle() -> Dict[str, Any]:
     error_message: Optional[str] = None
 
     async def _persist_progress():
-        """Обновляет run record с текущим прогрессом — чтобы можно было следить."""
         async with get_session() as session:
             await session.execute(
                 update(CompetitorScrapeRun)
@@ -414,24 +423,26 @@ async def run_one_cycle() -> Dict[str, Any]:
                         except Exception as e:
                             print(f"[scraper] item {item.get('id')} failed: {e}")
 
-                # NEW: флашим медиа батчами вместо ожидания конца цикла
                 if pages_fetched % MEDIA_FLUSH_EVERY_PAGES == 0 and media_queue:
-                    print(f"[scraper] page {page}: flushing {len(media_queue)} media items "
-                          f"(seen={listings_seen} new={listings_new})")
+                    print(
+                        f"[scraper] page {page}: flushing {len(media_queue)} media items "
+                        f"(seen={listings_seen} new={listings_new})"
+                    )
                     flush_stats = await flush_pending_media(client, media_queue)
                     media_stats["ok"] += flush_stats["ok"]
                     media_stats["failed"] += flush_stats["failed"]
                     media_queue.clear()
                     await _persist_progress()
-                    print(f"[scraper] flush done: ok={flush_stats['ok']} failed={flush_stats['failed']} "
-                          f"| total ok={media_stats['ok']} failed={media_stats['failed']}")
+                    print(
+                        f"[scraper] flush done: ok={flush_stats['ok']} failed={flush_stats['failed']} "
+                        f"| total ok={media_stats['ok']} failed={media_stats['failed']}"
+                    )
 
                 if not payload.get("has_next"):
                     break
                 page += 1
                 await asyncio.sleep(DEFAULT_DELAY_SEC)
 
-            # Финальный флаш — то, что не успело попасть в инкрементальный
             if media_queue:
                 print(f"[scraper] final flush: {len(media_queue)} items")
                 flush_stats = await flush_pending_media(client, media_queue)
